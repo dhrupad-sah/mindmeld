@@ -46,5 +46,6 @@ export const saveConfig = (c: Config) => writeJson("config.json", c);
 export const loadDaemonInfo = () => readJson<DaemonInfo>("daemon.json");
 export const saveDaemonInfo = (d: DaemonInfo) => writeJson("daemon.json", d);
 
-export const DEFAULT_RELAY = "ws://localhost:8787";
+/** Hosted relay (Cloudflare Worker, relay-worker/). It only ever sees ciphertext. Override with --relay or CLAUDE_SHARE_RELAY. */
+export const DEFAULT_RELAY = process.env.CLAUDE_SHARE_RELAY ?? "wss://claude-share-relay.thedhrupad.workers.dev";
 export const defaultName = () => userInfo().username;

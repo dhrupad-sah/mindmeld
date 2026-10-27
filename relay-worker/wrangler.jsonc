@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "claude-share-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-20",
+  // Thedhrupad@gmail.com's Account
+  "account_id": "7ed5d8cfe91c1eb8e81711afaea457e0",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "Room" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
+}

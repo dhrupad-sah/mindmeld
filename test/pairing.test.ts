@@ -8,11 +8,17 @@ import { startRelay } from "../src/relay.js";
 let relay: Server;
 let relayUrl: string;
 
+// RELAY_URL=ws://… runs the suite against an external relay (e.g. the Cloudflare Worker).
 beforeEach(async () => {
+  if (process.env.RELAY_URL) {
+    relayUrl = process.env.RELAY_URL;
+    return;
+  }
   relay = await startRelay(0, "127.0.0.1");
   relayUrl = `ws://127.0.0.1:${(relay.address() as { port: number }).port}`;
 });
 afterEach(async () => {
+  if (process.env.RELAY_URL) return;
   relay.closeAllConnections?.();
   await new Promise((r) => relay.close(r));
 });

@@ -42,7 +42,12 @@ function http(port: number, token: string, method: string, path: string, body?: 
   });
 }
 
+// RELAY_URL=ws://… runs the suite against an external relay (e.g. the Cloudflare Worker).
 beforeEach(async () => {
+  if (process.env.RELAY_URL) {
+    relayUrl = process.env.RELAY_URL;
+    return;
+  }
   relay = await startRelay(0, "127.0.0.1");
   const addr = relay.address() as { port: number };
   relayUrl = `ws://127.0.0.1:${addr.port}`;
@@ -50,7 +55,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await Promise.all(daemons.splice(0).map((d) => d.stop()));
-  await new Promise((r) => relay.close(r));
+  if (!process.env.RELAY_URL) await new Promise((r) => relay.close(r));
 });
 
 describe("end to end", () => {

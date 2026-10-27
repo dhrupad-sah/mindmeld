@@ -13,14 +13,14 @@ import { describeSession, listSessions, type SessionInfo } from "./sessions.js";
 
 const USAGE = `claude-share — let teammates' Claude Code sessions ask each other questions
 
-  claude-share relay [--port 8787]                     run a relay (one of you, or a server)
-  claude-share pair  [--relay ws://host:8787] [--name alice] [--new-group]
+  claude-share pair  [--name alice] [--new-group] [--relay wss://…]
                                                        invite someone: prints a one-time code
-  claude-share join  <code> [--relay ...] [--name bob] join with a friend's invite code
+  claude-share join  <code> [--name bob]               join with a friend's invite code
   claude-share up    [--session <id|latest>] [--auto-approve]
                                                        run the daemon (in your project dir)
   claude-share sessions                                list Claude sessions in this directory
   claude-share mcp                                     MCP server (used by Claude Code)
+  claude-share relay [--port 8787]                     self-host a relay (optional; a hosted one is the default)
 
 Register with Claude Code:  claude mcp add claude-share -- claude-share mcp`;
 
@@ -61,7 +61,8 @@ async function main() {
       const code = generateInviteCode();
       console.log(prev ? "Inviting someone into your existing group." : "Created a new group.");
       console.log(`\nInvite code: ${bold(code)}   ${dim("(one-time, expires in 15 minutes)")}`);
-      console.log(`Send your friend:  claude-share join ${code} --relay ${config.relay}\n`);
+      const relayHint = config.relay === DEFAULT_RELAY ? "" : ` --relay ${config.relay}`;
+      console.log(`Send your friend:  claude-share join ${code}${relayHint}\n`);
       console.log(dim("waiting for them to join… (keep this running)"));
       const { peerName } = await runInviter({ relay: config.relay, code, secret: config.secret, name: config.name });
       console.log(`${cyan("✓")} paired with ${bold(peerName)}. Next: ${bold("claude-share up")} in your project directory.`);
@@ -69,7 +70,7 @@ async function main() {
     }
     case "join": {
       const code = positionals[0];
-      if (!code) throw new Error("usage: claude-share join <code> [--relay ws://host:8787]");
+      if (!code) throw new Error("usage: claude-share join <code>");
       const prev = loadConfigOrNull();
       const relay = values.relay ?? prev?.relay ?? DEFAULT_RELAY;
       const name = values.name ?? prev?.name ?? defaultName();

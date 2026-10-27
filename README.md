@@ -12,12 +12,6 @@ The answer comes from a **headless fork of the session your teammate picked** in
 
 ## Quick start
 
-One of you runs a relay. It can be a laptop on the same Wi-Fi, a VPS, or a machine on your Tailscale network:
-
-```sh
-npx claude-share-mcp relay --port 8787
-```
-
 Install (each of you):
 
 ```sh
@@ -30,11 +24,11 @@ Pair once. The inviter keeps `pair` running until the friend joins:
 
 ```sh
 # you
-claude-share pair --relay ws://<relay-host>:8787 --name dhrupad
+claude-share pair --name dhrupad
 # → Invite code: k7q2-9xmd-4tpa   (one-time, expires in 15 minutes)
 
 # your friend
-claude-share join k7q2-9xmd-4tpa --relay ws://<relay-host>:8787 --name sarim
+claude-share join k7q2-9xmd-4tpa --name sarim
 ```
 
 To add a third person, run `claude-share pair` again. It invites them into the same group.
@@ -74,6 +68,10 @@ We batched requests in src/fetch.ts…
 ```
 
 `claude-share up --auto-approve` skips both prompts. Only use it with people you trust.
+
+## Relay
+
+By default, both sides connect to a hosted relay (a Cloudflare Worker, source in [`relay-worker/`](relay-worker/)). It only passes along encrypted frames and stores nothing. To run your own, use `claude-share relay --port 8787` on any reachable machine, or deploy `relay-worker/` to your own Cloudflare account. Then pass `--relay ws://host:8787` to `pair` and `join`, or set `CLAUDE_SHARE_RELAY`.
 
 ## Safety model
 
