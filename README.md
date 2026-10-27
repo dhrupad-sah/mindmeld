@@ -1,4 +1,4 @@
-# claude-share (`claude-share-mcp` on npm)
+# mindmeld
 
 Let your Claude Code session ask your teammate's Claude Code session a question, and get the answer back without copy-paste.
 
@@ -13,20 +13,25 @@ The answer comes from a **read-only copy of the Claude session your teammate has
 ## Setup (each of you, once)
 
 ```sh
-npm install -g claude-share-mcp
-claude mcp add -s user claude-share -- claude-share mcp
+claude plugin install mindmeld --marketplace dhrupad-sah/claude-share
 ```
 
-> The npm package is `claude-share-mcp`. Don't run `npx claude-share`: that's an unrelated package.
+Restart Claude Code afterwards. The plugin starts its MCP server through `npx`, so the only requirement is Node 20+.
+
+<details><summary>Without the plugin</summary>
+
+```sh
+npm install -g mindmeld-mcp
+claude mcp add -s user mindmeld -- mindmeld mcp
+```
+</details>
 
 ## Connect
 
-In Claude Code, just say it:
+- **You:** `/mindmeld:invite` (or just say *"invite a teammate to mindmeld"*). Claude gives you a code like `k7q2-9xmd-4tpa` and a message to send. The code works once and expires in 15 minutes.
+- **Them:** `/mindmeld:join k7q2-9xmd-4tpa`. Connected.
 
-- **You:** *"invite a teammate to claude-share"* → Claude gives you a code like `k7q2-9xmd-4tpa`. Send it to them. It works once and expires in 15 minutes.
-- **Them:** *"join claude-share with code k7q2-9xmd-4tpa"* → connected.
-
-That's it. From then on you're online whenever you have a Claude Code session open. There's nothing else to run.
+From then on you're online whenever you have a Claude Code session open. There's nothing else to run. `/mindmeld:peers` shows who's around.
 
 ## Use
 
@@ -35,14 +40,14 @@ That's it. From then on you're online whenever you have a Claude Code session op
 On Sarim's side, Claude Code shows a dialog:
 
 ```
-MCP server claude-share requests your input
+MCP server mindmeld requests your input
 Dhrupad asks: How did you set up the auth middleware?
 Answer with a read-only copy of this session? You'll see the answer before it's sent.
-  [ ] Always allow Dhrupad
+(To skip these prompts for Dhrupad, tell Claude "always allow Dhrupad".)
   Accept   Decline
 ```
 
-Sarim accepts, a read-only copy of that session writes the answer, Sarim approves the draft, and it lands in your Claude. If Sarim ticks **Always allow**, Dhrupad's later questions are answered without any prompts.
+Sarim presses Enter, a read-only copy of that session writes the answer, and a second dialog shows the draft. Another Enter sends it to your Claude. Telling Claude *"always allow Dhrupad"* skips both dialogs for Dhrupad from then on. *"stop allowing Dhrupad"* turns that off.
 
 If Sarim has several Claude sessions open, the question goes to the one used most recently. `list_peers` shows each session and what it's about.
 
@@ -51,6 +56,7 @@ If Sarim has several Claude sessions open, the question goes to the one used mos
 | tool | what it does |
 |---|---|
 | `invite_peer` / `join_peer` | pair with a teammate |
+| `trust_peer` | always allow, or stop allowing, someone's questions |
 | `list_peers` | who's online, in which project and session |
 | `ask_peer` | ask a question; blocks until the answer arrives |
 | `share_snippet` / `read_inbox` | send or receive code and notes, no reply needed |
@@ -60,15 +66,15 @@ If Sarim has several Claude sessions open, the question goes to the one used mos
 Everything above works from inside Claude. The CLI is there for scripts and servers:
 
 ```sh
-claude-share pair / join <code>     # pair from a terminal instead
-claude-share up --auto-approve      # an always-on answerer for a project (no dialogs; trusted groups only)
-claude-share sessions               # list Claude sessions in this directory
-claude-share relay                  # self-host a relay
+mindmeld pair / join <code>     # pair from a terminal instead
+mindmeld up --auto-approve      # an always-on answerer for a project (no dialogs; trusted groups only)
+mindmeld sessions               # list Claude sessions in this directory
+mindmeld relay                  # self-host a relay
 ```
 
 ## Relay
 
-By default, both sides connect to a hosted relay (a Cloudflare Worker, source in [`relay-worker/`](relay-worker/)). It only passes along encrypted frames and stores nothing. To run your own, use `claude-share relay --port 8787` on any reachable machine, or deploy `relay-worker/` to your own Cloudflare account. Then pass `--relay ws://host:8787` to `pair` and `join`, or set `CLAUDE_SHARE_RELAY`.
+By default, both sides connect to a hosted relay (a Cloudflare Worker, source in [`relay-worker/`](relay-worker/)). It only passes along encrypted frames and stores nothing. To run your own, use `mindmeld relay --port 8787` on any reachable machine, or deploy `relay-worker/` to your own Cloudflare account. Then pass `--relay ws://host:8787` to `pair` and `join`, or set `MINDMELD_RELAY`.
 
 ## Safety model
 
@@ -102,5 +108,5 @@ MIT licensed.
 
 ## Upgrading
 
-- **From 0.2:** your pairing still works. Remove any old `claude mcp add claude-share …` entry, add the user-scope one above, and stop running `claude-share up`, since Claude itself is now the client.
-- **From 0.1:** pairing changed, so pair again with `invite_peer` / `join_peer`.
+- **From claude-share 0.2:** your pairing carries over automatically (`~/.claude-share` is copied to `~/.mindmeld`). Install the plugin, remove the old entry with `claude mcp remove claude-share`, and stop running `claude-share up`, since Claude itself is now the client.
+- **From claude-share 0.1:** pairing changed, so pair again with `/mindmeld:invite` and `/mindmeld:join`.

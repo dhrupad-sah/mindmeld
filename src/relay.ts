@@ -16,7 +16,7 @@ export function startRelay(port: number, host = "0.0.0.0"): Promise<Server> {
   const rooms = new Map<string, Set<WebSocket>>();
   const http = createServer((_req, res) => {
     res.writeHead(200, { "content-type": "text/plain" });
-    res.end("claude-share relay\n");
+    res.end("mindmeld relay\n");
   });
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
 

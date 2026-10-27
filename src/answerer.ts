@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 
 const FORK_TIMEOUT_MS = 5 * 60_000;
 
-const PEER_GUARD = `A teammate's Claude Code session is asking you a question through claude-share.
+const PEER_GUARD = `A teammate's Claude Code session is asking you a question through mindmeld.
 Answer it from what you know in this session: what was built, how problems were solved, and why.
 Rules:
 - Explain only. Do not modify files or take actions.
@@ -22,7 +22,7 @@ export function answerWithFork(opts: {
   context?: string;
   sessionId?: string;
 }): Promise<string> {
-  const bin = process.env.CLAUDE_SHARE_CLAUDE_BIN ?? "claude";
+  const bin = process.env.MINDMELD_CLAUDE_BIN ?? process.env.CLAUDE_SHARE_CLAUDE_BIN ?? "claude";
   const args = [
     "-p",
     ...(opts.sessionId ? ["--resume", opts.sessionId] : ["--continue"]),

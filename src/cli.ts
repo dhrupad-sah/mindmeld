@@ -11,18 +11,19 @@ import { runInviter, runJoiner } from "./pairing.js";
 import { startRelay } from "./relay.js";
 import { describeSession, listSessions, type SessionInfo } from "./sessions.js";
 
-const USAGE = `claude-share — let teammates' Claude Code sessions ask each other questions
+const USAGE = `mindmeld — let teammates' Claude Code sessions ask each other questions
 
-  claude-share pair  [--name alice] [--new-group] [--relay wss://…]
+  mindmeld pair  [--name alice] [--new-group] [--relay wss://…]
                                                        invite someone: prints a one-time code
-  claude-share join  <code> [--name bob]               join with a friend's invite code
-  claude-share up    [--session <id|latest>] [--auto-approve]
+  mindmeld join  <code> [--name bob]               join with a friend's invite code
+  mindmeld up    [--session <id|latest>] [--auto-approve]
                                                        run the daemon (in your project dir)
-  claude-share sessions                                list Claude sessions in this directory
-  claude-share mcp                                     MCP server (used by Claude Code)
-  claude-share relay [--port 8787]                     self-host a relay (optional; a hosted one is the default)
+  mindmeld sessions                                list Claude sessions in this directory
+  mindmeld mcp                                     MCP server (used by Claude Code)
+  mindmeld relay [--port 8787]                     self-host a relay (optional; a hosted one is the default)
 
-Register with Claude Code:  claude mcp add claude-share -- claude-share mcp`;
+Easiest: install the Claude Code plugin and do everything from Claude:
+  claude plugin install mindmeld --marketplace dhrupad-sah/claude-share`;
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
@@ -62,22 +63,22 @@ async function main() {
       console.log(prev ? "Inviting someone into your existing group." : "Created a new group.");
       console.log(`\nInvite code: ${bold(code)}   ${dim("(one-time, expires in 15 minutes)")}`);
       const relayHint = config.relay === DEFAULT_RELAY ? "" : ` --relay ${config.relay}`;
-      console.log(`Send your friend:  claude-share join ${code}${relayHint}\n`);
+      console.log(`Send your friend:  mindmeld join ${code}${relayHint}\n`);
       console.log(dim("waiting for them to join… (keep this running)"));
       const { peerName } = await runInviter({ relay: config.relay, code, secret: config.secret, name: config.name });
-      console.log(`${cyan("✓")} paired with ${bold(peerName)}. Next: ${bold("claude-share up")} in your project directory.`);
+      console.log(`${cyan("✓")} paired with ${bold(peerName)}. Next: ${bold("mindmeld up")} in your project directory.`);
       return;
     }
     case "join": {
       const code = positionals[0];
-      if (!code) throw new Error("usage: claude-share join <code>");
+      if (!code) throw new Error("usage: mindmeld join <code>");
       const prev = loadConfigOrNull();
       const relay = values.relay ?? prev?.relay ?? DEFAULT_RELAY;
       const name = values.name ?? prev?.name ?? defaultName();
       const { secret, inviterName } = await runJoiner({ relay, code, name });
       saveConfig({ secret, relay, name });
       console.log(`${cyan("✓")} joined ${bold(inviterName)}'s group as ${bold(name)}.`);
-      console.log(`Next: run ${bold("claude-share up")} in your project directory.`);
+      console.log(`Next: run ${bold("mindmeld up")} in your project directory.`);
       return;
     }
     case "sessions": {
@@ -113,7 +114,7 @@ async function chooseSession(cwd: string, flag: string | undefined, rl: Interfac
     if (match.length === 1) return match[0].id;
     if (match.length > 1) throw new Error(`--session ${flag} matches ${match.length} sessions; use more characters`);
     if (/^[0-9a-f-]{36}$/.test(flag)) return flag; // not found locally; let claude --resume decide
-    throw new Error(`no session starting with "${flag}" in this directory (see: claude-share sessions)`);
+    throw new Error(`no session starting with "${flag}" in this directory (see: mindmeld sessions)`);
   }
   if (!rl || sessions.length === 0) return null;
 
@@ -137,7 +138,7 @@ function sessionForQuestion(cwd: string, pinned: string | null): SessionInfo | {
 
 async function up(autoApprove: boolean, sessionFlag: string | undefined) {
   const config = loadConfig();
-  if (!config) throw new Error("not paired yet: run `claude-share pair` or `claude-share join <code>` first");
+  if (!config) throw new Error("not paired yet: run `mindmeld pair` or `mindmeld join <code>` first");
   const cwd = process.cwd();
   const interactive = Boolean(process.stdin.isTTY);
   if (!interactive && !autoApprove) {
@@ -163,7 +164,7 @@ async function up(autoApprove: boolean, sessionFlag: string | undefined) {
   daemon.on("snippet", (s) => console.log(`${cyan("✉")} snippet received: ${s.title}`));
 
   daemon.start();
-  console.log(`${bold("claude-share")} up as ${bold(config.name)} in ${cwd}`);
+  console.log(`${bold("mindmeld")} up as ${bold(config.name)} in ${cwd}`);
   const which = pinned ? `session ${pinned.slice(0, 8)}` : "your most recent session";
   console.log(dim(`answers come from a read-only fork of ${which} here${autoApprove ? " (auto-approve ON)" : ""}`));
 

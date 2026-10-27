@@ -1,0 +1,18 @@
+{
+  "name": "mindmeld",
+  "owner": {
+    "name": "Dhrupad Sah",
+    "url": "https://github.com/dhrupad-sah"
+  },
+  "metadata": {
+    "description": "Let your Claude Code session ask a teammate's Claude Code session questions"
+  },
+  "plugins": [
+    {
+      "name": "mindmeld",
+      "version": "0.3.0",
+      "source": "./plugin",
+      "description": "Ask a teammate's Claude Code session questions. E2E encrypted, read-only answers, approved in Claude."
+    }
+  ]
+}

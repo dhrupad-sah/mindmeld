@@ -1,10 +1,11 @@
 {
-  "name": "claude-share-mcp",
-  "version": "0.3.0-dev",
-  "description": "Let two people's Claude Code sessions ask each other questions over LAN or the internet.",
+  "name": "mindmeld-mcp",
+  "version": "0.3.0",
+  "description": "mindmeld: let your Claude Code session ask a teammate's Claude Code session questions. E2E encrypted, read-only answers, approved in Claude.",
   "type": "module",
   "license": "MIT",
   "bin": {
+    "mindmeld": "dist/cli.js",
     "claude-share": "dist/cli.js"
   },
   "files": [
@@ -33,6 +34,7 @@
     "vitest": "^4.1.12"
   },
   "keywords": [
+    "mindmeld",
     "claude",
     "claude-code",
     "mcp",

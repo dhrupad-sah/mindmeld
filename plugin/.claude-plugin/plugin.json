@@ -1,0 +1,18 @@
+{
+  "name": "mindmeld",
+  "version": "0.3.0",
+  "description": "Ask a teammate's Claude Code session questions and get answers from their session history. End-to-end encrypted; answers come from a read-only copy of their session; they approve each one.",
+  "author": {
+    "name": "Dhrupad Sah",
+    "url": "https://github.com/dhrupad-sah"
+  },
+  "homepage": "https://github.com/dhrupad-sah/claude-share",
+  "repository": "https://github.com/dhrupad-sah/claude-share",
+  "license": "MIT",
+  "keywords": [
+    "collaboration",
+    "pair-programming",
+    "mcp",
+    "teams"
+  ]
+}

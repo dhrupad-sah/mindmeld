@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mindmeld": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "mindmeld-mcp@^0.3.0",
+        "mcp"
+      ]
+    }
+  }
+}

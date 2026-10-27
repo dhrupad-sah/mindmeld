@@ -38,7 +38,7 @@ function ago(ms: number): string {
  * dialogs in that session and answered by a read-only fork of it.
  */
 export async function runMcpServer(): Promise<void> {
-  const server = new McpServer({ name: "claude-share", version: "0.3.0" });
+  const server = new McpServer({ name: "mindmeld", version: "0.3.0" });
   const cwd = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const mySessionId = process.env.CLAUDE_CODE_SESSION_ID;
   let daemon: Daemon | null = null;
@@ -126,7 +126,7 @@ export async function runMcpServer(): Promise<void> {
     "list_peers",
     {
       title: "List peers",
-      description: "List teammates connected through claude-share right now, one line per open Claude session.",
+      description: "List teammates connected through mindmeld right now, one line per open Claude session.",
       inputSchema: {},
     },
     async () => {
@@ -246,16 +246,16 @@ export async function runMcpServer(): Promise<void> {
 
       const code = generateInviteCode();
       runInviter({ relay: config.relay, code, secret: config.secret, name: config.name }).then(
-        ({ peerName }) => console.error(`claude-share: ${peerName} joined`),
-        (e) => console.error(`claude-share: invite ${code} ended: ${(e as Error).message}`),
+        ({ peerName }) => console.error(`mindmeld: ${peerName} joined`),
+        (e) => console.error(`mindmeld: invite ${code} ended: ${(e as Error).message}`),
       );
       return text(
         [
           `Invite code: ${code}`,
           "",
           "Tell the user to send their teammate this message:",
-          `  Install: npm install -g claude-share-mcp && claude mcp add -s user claude-share -- claude-share mcp`,
-          `  Then tell Claude: "join claude-share with code ${code}"`,
+          `  1. Install (once): claude plugin install mindmeld --marketplace dhrupad-sah/claude-share`,
+          `  2. In Claude Code: /mindmeld:join ${code}`,
           "",
           `The code works once and expires in 15 minutes. Keep this session open until they've joined. You'll appear to them as "${config.name}".`,
         ].join("\n"),
