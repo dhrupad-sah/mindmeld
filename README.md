@@ -24,6 +24,8 @@ Install (each of you):
 npm install -g claude-share-mcp     # gives you the `claude-share` command
 ```
 
+> The npm package is `claude-share-mcp`. Don't run `npx claude-share`: that's an unrelated package. Without a global install, use `npx -y claude-share-mcp <command>`.
+
 Pair once. The inviter keeps `pair` running until the friend joins:
 
 ```sh
