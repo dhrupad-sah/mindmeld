@@ -1,5 +1,4 @@
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import WebSocket from "ws";
 import { keyFor, open, roomIdFor, seal } from "./crypto.js";
@@ -16,6 +15,8 @@ export interface PeerInfo {
   peer: string;
   name: string;
   project: string;
+  session?: string;
+  activeAt?: number;
   lastSeen: number;
 }
 
@@ -26,8 +27,8 @@ export interface DaemonOptions {
   name: string;
   project: string;
   decide: Decide;
-  /** Local API port; 0 picks a free one. */
-  port?: number;
+  /** Describes the Claude session behind this daemon, re-read on every hello. */
+  sessionInfo?: () => { label?: string; activeAt?: number };
   rateLimit?: { max: number; windowMs: number };
 }
 
@@ -39,11 +40,9 @@ interface PendingAsk {
 
 export class Daemon extends EventEmitter {
   readonly peerId = randomUUID();
-  readonly token = randomBytes(24).toString("hex");
   private readonly key: Buffer;
   private readonly roomUrl: string;
   private ws: WebSocket | null = null;
-  private http: Server | null = null;
   private helloTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   private readonly peers = new Map<string, PeerInfo>();
@@ -57,23 +56,9 @@ export class Daemon extends EventEmitter {
     this.roomUrl = `${opts.relay.replace(/\/$/, "")}/room/${roomIdFor(opts.secret)}`;
   }
 
-  async start(): Promise<number> {
+  start(): void {
     this.connect();
     this.helloTimer = setInterval(() => this.sendHello(), HELLO_INTERVAL_MS);
-    this.http = createServer((req, res) => {
-      this.handleHttp(req)
-        .then(([status, body]) => {
-          res.writeHead(status, { "content-type": "application/json" });
-          res.end(JSON.stringify(body));
-        })
-        .catch((e) => {
-          res.writeHead(500, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: String(e?.message ?? e) }));
-        });
-    });
-    await new Promise<void>((r) => this.http!.listen(this.opts.port ?? 0, "127.0.0.1", r));
-    const addr = this.http.address();
-    return typeof addr === "object" && addr ? addr.port : 0;
   }
 
   async stop(): Promise<void> {
@@ -82,7 +67,6 @@ export class Daemon extends EventEmitter {
     this.send({ type: "bye", peer: this.peerId });
     this.ws?.close();
     for (const p of this.pending.values()) p.resolve({ error: "daemon stopped" });
-    await new Promise<void>((r) => (this.http ? this.http.close(() => r()) : r()));
   }
 
   onlinePeers(): PeerInfo[] {
@@ -115,7 +99,20 @@ export class Daemon extends EventEmitter {
   }
 
   private sendHello(): void {
-    this.send({ type: "hello", peer: this.peerId, name: this.opts.name, project: this.opts.project });
+    let info: { label?: string; activeAt?: number } = {};
+    try {
+      info = this.opts.sessionInfo?.() ?? {};
+    } catch {
+      // best-effort metadata
+    }
+    this.send({
+      type: "hello",
+      peer: this.peerId,
+      name: this.opts.name,
+      project: this.opts.project,
+      session: info.label,
+      activeAt: info.activeAt,
+    });
   }
 
   private handleFrame(raw: string): void {
@@ -134,7 +131,14 @@ export class Daemon extends EventEmitter {
     switch (p.type) {
       case "hello": {
         const isNew = !this.onlinePeers().some((x) => x.peer === p.peer);
-        this.peers.set(p.peer, { peer: p.peer, name: p.name, project: p.project, lastSeen: Date.now() });
+        this.peers.set(p.peer, {
+          peer: p.peer,
+          name: p.name,
+          project: p.project,
+          session: p.session,
+          activeAt: p.activeAt,
+          lastSeen: Date.now(),
+        });
         if (isNew) {
           this.emit("peer-joined", this.peers.get(p.peer));
           this.sendHello(); // let the newcomer see us immediately
@@ -207,83 +211,64 @@ export class Daemon extends EventEmitter {
     }
   }
 
-  // ── outgoing operations (used by the local API) ─────────────────────
+  // ── outgoing operations ─────────────────────────────────────────────
 
-  private targets(peer?: string): PeerInfo[] {
+  /**
+   * Pick the one peer connection a message should go to. Each open Claude session is its own
+   * peer, so "sarim" may match several: route to the most recently active session.
+   * `peer` may be a peer id, a full name, or a first name (case-insensitive).
+   */
+  private route(peer?: string): PeerInfo | { error: string } {
     const online = this.onlinePeers();
-    return peer ? online.filter((p) => p.name === peer || p.peer === peer) : online;
+    if (online.length === 0) return { error: "no peers online" };
+    let matches: PeerInfo[];
+    if (peer) {
+      const q = peer.trim().toLowerCase();
+      matches = online.filter(
+        (p) => p.peer === peer || p.name.toLowerCase() === q || p.name.toLowerCase().split(/\s+/)[0] === q,
+      );
+      if (matches.length === 0) {
+        const names = [...new Set(online.map((p) => p.name))].join(", ");
+        return { error: `"${peer}" is not online (online: ${names})` };
+      }
+    } else {
+      const names = new Set(online.map((p) => p.name));
+      if (names.size > 1) return { error: `several people are online (${[...names].join(", ")}); say who to ask` };
+      matches = online;
+    }
+    return matches.reduce((best, p) => ((p.activeAt ?? 0) > (best.activeAt ?? 0) ? p : best));
   }
 
   ask(question: string, opts: { peer?: string; context?: string; timeoutSec?: number } = {}) {
-    const targets = this.targets(opts.peer);
-    if (targets.length === 0) {
-      return Promise.resolve({
-        error: opts.peer ? `peer "${opts.peer}" is not online` : "no peers online",
-      } as const);
-    }
+    const target = this.route(opts.peer);
+    if ("error" in target) return Promise.resolve(target);
     const id = randomUUID();
-    const to = opts.peer ? targets[0].peer : undefined;
+    const timeoutSec = opts.timeoutSec ?? 600;
     return new Promise<{ from: string; text: string } | { error: string }>((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        resolve({ error: `no answer within ${opts.timeoutSec ?? 600}s` });
-      }, (opts.timeoutSec ?? 600) * 1000);
+        resolve({ error: `no answer within ${timeoutSec}s` });
+      }, timeoutSec * 1000);
       this.pending.set(id, {
-        expected: targets.length,
+        expected: 1,
         declines: [],
         resolve: (r) => {
           clearTimeout(timer);
           resolve(r);
         },
       });
-      this.send({ type: "ask", id, from: this.peerId, to, question, context: opts.context });
+      this.send({ type: "ask", id, from: this.peerId, to: target.peer, question, context: opts.context });
     });
   }
 
-  snippet(title: string, text: string, peer?: string): { ok: true } | { error: string } {
-    const targets = this.targets(peer);
-    if (targets.length === 0) return { error: peer ? `peer "${peer}" is not online` : "no peers online" };
-    const to = peer ? targets[0].peer : undefined;
-    this.send({ type: "snippet", id: randomUUID(), from: this.peerId, to, title, text });
-    return { ok: true };
+  snippet(title: string, text: string, peer?: string): { ok: true; to: string } | { error: string } {
+    const target = this.route(peer);
+    if ("error" in target) return target;
+    this.send({ type: "snippet", id: randomUUID(), from: this.peerId, to: target.peer, title, text });
+    return { ok: true, to: target.name };
   }
 
   drainInbox(): Snippet[] {
     return this.inbox.splice(0);
   }
-
-  // ── local HTTP API ──────────────────────────────────────────────────
-
-  private authorized(req: IncomingMessage): boolean {
-    const got = Buffer.from(req.headers.authorization ?? "");
-    const want = Buffer.from(`Bearer ${this.token}`);
-    return got.length === want.length && timingSafeEqual(got, want);
-  }
-
-  private async handleHttp(req: IncomingMessage): Promise<[number, unknown]> {
-    if (!this.authorized(req)) return [401, { error: "unauthorized" }];
-    const route = `${req.method} ${req.url}`;
-    if (route === "GET /peers") {
-      return [200, this.onlinePeers().map(({ name, project, lastSeen }) => ({ name, project, lastSeen }))];
-    }
-    if (route === "GET /inbox") return [200, this.drainInbox()];
-    const body = await readJson(req);
-    if (route === "POST /ask") {
-      if (typeof body.question !== "string") return [400, { error: "question required" }];
-      return [200, await this.ask(body.question, body)];
-    }
-    if (route === "POST /snippet") {
-      if (typeof body.title !== "string" || typeof body.text !== "string") {
-        return [400, { error: "title and text required" }];
-      }
-      return [200, this.snippet(body.title, body.text, body.peer)];
-    }
-    return [404, { error: "not found" }];
-  }
-}
-
-async function readJson(req: IncomingMessage): Promise<any> {
-  let raw = "";
-  for await (const chunk of req) raw += chunk;
-  return raw ? JSON.parse(raw) : {};
 }

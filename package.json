@@ -1,6 +1,6 @@
 {
   "name": "claude-share-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0-dev",
   "description": "Let two people's Claude Code sessions ask each other questions over LAN or the internet.",
   "type": "module",
   "license": "MIT",

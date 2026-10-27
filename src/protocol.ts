@@ -2,7 +2,16 @@ import { z } from "zod";
 
 /** Decrypted payloads exchanged between peers. The relay never sees these. */
 export const Payload = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("hello"), peer: z.string(), name: z.string(), project: z.string() }),
+  z.object({
+    type: z.literal("hello"),
+    peer: z.string(),
+    name: z.string(),
+    project: z.string(),
+    /** Label for the Claude session behind this peer (its first prompt), if known. */
+    session: z.string().optional(),
+    /** When that session was last active (ms since epoch); used to route questions. */
+    activeAt: z.number().optional(),
+  }),
   z.object({ type: z.literal("bye"), peer: z.string() }),
   z.object({
     type: z.literal("ask"),

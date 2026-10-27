@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
@@ -7,12 +8,8 @@ export interface Config {
   secret: string;
   relay: string;
   name: string;
-}
-
-export interface DaemonInfo {
-  port: number;
-  token: string;
-  pid: number;
+  /** Peers whose questions are answered without asking (lowercased names). */
+  trusted?: string[];
 }
 
 export function homeDir(): string {
@@ -43,9 +40,16 @@ export function loadConfig(): Config | null {
   return c as Config;
 }
 export const saveConfig = (c: Config) => writeJson("config.json", c);
-export const loadDaemonInfo = () => readJson<DaemonInfo>("daemon.json");
-export const saveDaemonInfo = (d: DaemonInfo) => writeJson("daemon.json", d);
 
 /** Hosted relay (Cloudflare Worker, relay-worker/). It only ever sees ciphertext. Override with --relay or CLAUDE_SHARE_RELAY. */
 export const DEFAULT_RELAY = process.env.CLAUDE_SHARE_RELAY ?? "wss://claude-share-relay.thedhrupad.workers.dev";
-export const defaultName = () => userInfo().username;
+/** git's user.name if set, else the OS username. */
+export function defaultName(): string {
+  try {
+    const name = execFileSync("git", ["config", "--global", "user.name"], { encoding: "utf8", timeout: 2000 }).trim();
+    if (name) return name;
+  } catch {
+    // no git, or no name configured
+  }
+  return userInfo().username;
+}

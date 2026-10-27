@@ -1,5 +1,4 @@
 import type { Server } from "node:http";
-import { request } from "node:http";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { answerWithFork } from "../src/answerer.js";
@@ -21,28 +20,19 @@ async function waitFor(cond: () => boolean, ms = 3000) {
   }
 }
 
-async function makeDaemon(name: string, decide: Decide, code = CODE, rateLimit?: { max: number; windowMs: number }) {
-  const d = new Daemon({ secret: code, relay: relayUrl, name, project: `${name}-proj`, decide, rateLimit });
+async function makeDaemon(
+  name: string,
+  decide: Decide,
+  code = CODE,
+  rateLimit?: { max: number; windowMs: number },
+  sessionInfo?: () => { label?: string; activeAt?: number },
+) {
+  const d = new Daemon({ secret: code, relay: relayUrl, name, project: `${name}-proj`, decide, rateLimit, sessionInfo });
   daemons.push(d);
-  const port = await d.start();
-  return { d, port };
+  d.start();
+  return { d };
 }
 
-function http(port: number, token: string, method: string, path: string, body?: unknown): Promise<any> {
-  const payload = body ? JSON.stringify(body) : undefined;
-  return new Promise((resolve, reject) => {
-    const req = request({ host: "127.0.0.1", port, method, path, headers: { authorization: `Bearer ${token}` } }, (res) => {
-      let raw = "";
-      res.on("data", (c) => (raw += c));
-      res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(raw) }));
-    });
-    req.on("error", reject);
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
-
-// RELAY_URL=ws://… runs the suite against an external relay (e.g. the Cloudflare Worker).
 beforeEach(async () => {
   if (process.env.RELAY_URL) {
     relayUrl = process.env.RELAY_URL;
@@ -59,22 +49,16 @@ afterEach(async () => {
 });
 
 describe("end to end", () => {
-  it("discovers peers and answers a question through the local API", async () => {
-    const { d: alice, port } = await makeDaemon("alice", async () => ({ action: "send", text: "unused" }));
+  it("discovers peers and answers a question", async () => {
+    const { d: alice } = await makeDaemon("alice", async () => ({ action: "send", text: "unused" }));
     const { d: bob } = await makeDaemon("bob", async (ask) => ({ action: "send", text: `bob says: ${ask.question} (from ${ask.from})` }));
     await waitFor(() => alice.onlinePeers().length === 1 && bob.onlinePeers().length === 1);
 
-    const peers = await http(port, alice.token, "GET", "/peers");
-    expect(peers.body).toEqual([expect.objectContaining({ name: "bob", project: "bob-proj" })]);
-
-    const r = await http(port, alice.token, "POST", "/ask", { question: "how did you fix auth?", peer: "bob" });
-    expect(r.body).toEqual({ from: "bob", text: "bob says: how did you fix auth? (from alice)" });
-  });
-
-  it("rejects requests without the token", async () => {
-    const { port } = await makeDaemon("alice", async () => ({ action: "decline", reason: "x" }));
-    const r = await http(port, "wrong", "GET", "/peers");
-    expect(r.status).toBe(401);
+    expect(alice.onlinePeers()).toEqual([expect.objectContaining({ name: "bob", project: "bob-proj" })]);
+    expect(await alice.ask("how did you fix auth?", { peer: "bob" })).toEqual({
+      from: "bob",
+      text: "bob says: how did you fix auth? (from alice)",
+    });
   });
 
   it("reports declines and unknown peers", async () => {
@@ -82,7 +66,7 @@ describe("end to end", () => {
     await makeDaemon("bob", async () => ({ action: "decline", reason: "busy" }));
     await waitFor(() => alice.onlinePeers().length === 1);
     expect(await alice.ask("q")).toEqual({ error: "declined — bob: busy" });
-    expect(await alice.ask("q", { peer: "carol" })).toEqual({ error: 'peer "carol" is not online' });
+    expect(await alice.ask("q", { peer: "carol" })).toEqual({ error: '"carol" is not online (online: bob)' });
   });
 
   it("isolates rooms with different codes", async () => {
@@ -103,6 +87,27 @@ describe("end to end", () => {
     expect(asked).toEqual(["carol"]);
   });
 
+  it("routes to the person's most recently active session", async () => {
+    const asked: string[] = [];
+    const { d: alice } = await makeDaemon("Alice", async () => ({ action: "send", text: "" }));
+    await makeDaemon("Sarim Khan", async () => (asked.push("old"), { action: "send", text: "old" }), CODE, undefined, () => ({ label: "auth work", activeAt: 1000 }));
+    await makeDaemon("Sarim Khan", async () => (asked.push("new"), { action: "send", text: "new" }), CODE, undefined, () => ({ label: "scraper", activeAt: 2000 }));
+    await waitFor(() => alice.onlinePeers().length === 2);
+    expect(alice.onlinePeers().map((p) => p.session).sort()).toEqual(["auth work", "scraper"]);
+    expect(await alice.ask("q", { peer: "sarim" })).toEqual({ from: "Sarim Khan", text: "new" });
+    expect(await alice.ask("q")).toEqual({ from: "Sarim Khan", text: "new" }); // one person online: no name needed
+    await new Promise((r) => setTimeout(r, 100));
+    expect(asked).toEqual(["new", "new"]);
+  });
+
+  it("asks you to name someone when several people are online", async () => {
+    const { d: alice } = await makeDaemon("alice", async () => ({ action: "send", text: "" }));
+    await makeDaemon("bob", async () => ({ action: "send", text: "" }));
+    await makeDaemon("carol", async () => ({ action: "send", text: "" }));
+    await waitFor(() => alice.onlinePeers().length === 2);
+    expect(await alice.ask("q")).toEqual({ error: expect.stringMatching(/several people are online \((bob, carol|carol, bob)\)/) });
+  });
+
   it("rate limits a chatty peer", async () => {
     const { d: alice } = await makeDaemon("alice", async () => ({ action: "send", text: "" }));
     await makeDaemon("bob", async () => ({ action: "send", text: "ok" }), CODE, { max: 2, windowMs: 60_000 });
@@ -116,7 +121,7 @@ describe("end to end", () => {
     const { d: alice } = await makeDaemon("alice", async () => ({ action: "send", text: "" }));
     const { d: bob } = await makeDaemon("bob", async () => ({ action: "send", text: "" }));
     await waitFor(() => alice.onlinePeers().length === 1);
-    expect(alice.snippet("notes", "use a retry queue", "bob")).toEqual({ ok: true });
+    expect(alice.snippet("notes", "use a retry queue", "bob")).toEqual({ ok: true, to: "bob" });
     const received = new Promise((r) => bob.once("snippet", r));
     await received;
     expect(bob.drainInbox()).toEqual([expect.objectContaining({ from: "alice", title: "notes", text: "use a retry queue" })]);

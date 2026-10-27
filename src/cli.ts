@@ -4,7 +4,7 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { answerWithFork } from "./answerer.js";
 import { generateGroupSecret, generateInviteCode } from "./crypto.js";
-import { DEFAULT_RELAY, defaultName, loadConfig, saveConfig, saveDaemonInfo, type Config } from "./config.js";
+import { DEFAULT_RELAY, defaultName, loadConfig, saveConfig, type Config } from "./config.js";
 import { Daemon, type Decide, type Decision } from "./daemon.js";
 import { runMcpServer } from "./mcp.js";
 import { runInviter, runJoiner } from "./pairing.js";
@@ -162,8 +162,7 @@ async function up(autoApprove: boolean, sessionFlag: string | undefined) {
   daemon.on("peer-left", (p) => console.log(dim(`○ ${p.name} went offline`)));
   daemon.on("snippet", (s) => console.log(`${cyan("✉")} snippet received: ${s.title}`));
 
-  const port = await daemon.start();
-  saveDaemonInfo({ port, token: daemon.token, pid: process.pid });
+  daemon.start();
   console.log(`${bold("claude-share")} up as ${bold(config.name)} in ${cwd}`);
   const which = pinned ? `session ${pinned.slice(0, 8)}` : "your most recent session";
   console.log(dim(`answers come from a read-only fork of ${which} here${autoApprove ? " (auto-approve ON)" : ""}`));

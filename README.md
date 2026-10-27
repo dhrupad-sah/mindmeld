@@ -3,71 +3,68 @@
 Let your Claude Code session ask your teammate's Claude Code session a question, and get the answer back without copy-paste.
 
 ```
-you:        "ask Alex's Claude how they got the scraper so fast"
-your Claude ──ask_peer──► relay ──► Alex's daemon ──► read-only fork of Alex's session
-your Claude ◄──answer──── relay ◄── Alex approves ◄── "We batched requests in src/fetch.ts…"
+you:        "ask Sarim how they got the scraper so fast"
+your Claude ──ask_peer──► relay ──► Sarim's Claude: "Dhrupad asks… [Accept] [Decline]"
+your Claude ◄──answer──── relay ◄── read-only copy of Sarim's session: "We moved to a worker pool…"
 ```
 
-The answer comes from a **headless fork of the session your teammate picked** in their project. It knows what they built and why, and their live session isn't touched.
+The answer comes from a **read-only copy of the Claude session your teammate has open**. It knows what they built and why, and their live session isn't touched.
 
-## Quick start
-
-Install (each of you):
+## Setup (each of you, once)
 
 ```sh
-npm install -g claude-share-mcp     # gives you the `claude-share` command
+npm install -g claude-share-mcp
+claude mcp add -s user claude-share -- claude-share mcp
 ```
 
-> The npm package is `claude-share-mcp`. Don't run `npx claude-share`: that's an unrelated package. Without a global install, use `npx -y claude-share-mcp <command>`.
+> The npm package is `claude-share-mcp`. Don't run `npx claude-share`: that's an unrelated package.
 
-Pair once. The inviter keeps `pair` running until the friend joins:
+## Connect
 
-```sh
-# you
-claude-share pair --name dhrupad
-# → Invite code: k7q2-9xmd-4tpa   (one-time, expires in 15 minutes)
+In Claude Code, just say it:
 
-# your friend
-claude-share join k7q2-9xmd-4tpa --name sarim
+- **You:** *"invite a teammate to claude-share"* → Claude gives you a code like `k7q2-9xmd-4tpa`. Send it to them. It works once and expires in 15 minutes.
+- **Them:** *"join claude-share with code k7q2-9xmd-4tpa"* → connected.
+
+That's it. From then on you're online whenever you have a Claude Code session open. There's nothing else to run.
+
+## Use
+
+*"Ask Sarim how they set up the auth middleware."*
+
+On Sarim's side, Claude Code shows a dialog:
+
+```
+MCP server claude-share requests your input
+Dhrupad asks: How did you set up the auth middleware?
+Answer with a read-only copy of this session? You'll see the answer before it's sent.
+  [ ] Always allow Dhrupad
+  Accept   Decline
 ```
 
-To add a third person, run `claude-share pair` again. It invites them into the same group.
+Sarim accepts, a read-only copy of that session writes the answer, Sarim approves the draft, and it lands in your Claude. If Sarim ticks **Always allow**, Dhrupad's later questions are answered without any prompts.
 
-Each of you, in your project directory:
-
-```sh
-claude-share up                      # pick which session answers, then keep this terminal open
-claude mcp add claude-share -- claude-share mcp
-```
-
-`up` lists your Claude sessions in that folder, showing each one's first prompt, and you choose which one answers. Press Enter to always use whichever is most recent. To skip the prompt, use `--session <id-prefix>` or `--session latest`. `claude-share sessions` prints the list.
-
-Then just talk to Claude: *"ask alex how they set up the auth middleware."*
+If Sarim has several Claude sessions open, the question goes to the one used most recently. `list_peers` shows each session and what it's about.
 
 ## Tools Claude gets
 
 | tool | what it does |
 |---|---|
-| `list_peers` | who's online, and in which project |
+| `invite_peer` / `join_peer` | pair with a teammate |
+| `list_peers` | who's online, in which project and session |
 | `ask_peer` | ask a question; blocks until the answer arrives |
-| `share_snippet` | push code or notes to a teammate's inbox |
-| `read_inbox` | read what teammates shared with you |
+| `share_snippet` / `read_inbox` | send or receive code and notes, no reply needed |
 
-## When a question arrives
+## Terminal commands (optional)
 
+Everything above works from inside Claude. The CLI is there for scripts and servers:
+
+```sh
+claude-share pair / join <code>     # pair from a terminal instead
+claude-share up --auto-approve      # an always-on answerer for a project (no dialogs; trusted groups only)
+claude-share sessions               # list Claude sessions in this directory
+claude-share relay                  # self-host a relay
 ```
-? dhrupad asks:
-How did you get the scraper so fast?
-[a]uto-answer with Claude  [w]rite reply  [d]ecline > a
-asking a fork of your latest session…
-
-draft answer:
-We batched requests in src/fetch.ts…
-
-[s]end  [e]dit  [d]ecline >
-```
-
-`claude-share up --auto-approve` skips both prompts. Only use it with people you trust.
 
 ## Relay
 
@@ -83,7 +80,9 @@ By default, both sides connect to a hosted relay (a Cloudflare Worker, source in
 - **Rate limited.** At most 10 questions per peer per 10 minutes.
 - **Local API.** The daemon binds to `127.0.0.1`, and every request needs a random bearer token stored in `~/.claude-share/daemon.json` (mode 600).
 
-Known limits: the relay can see who's online, when, and how much data moves (not the content). The session list reads Claude Code's on-disk transcript layout, which isn't a documented API. If it changes, `up` falls back to "most recent session".
+- **Names aren't authenticated within a group.** Anyone you've paired with holds the group secret and could claim another member's name. "Always allow" trusts a name, so only pair with people you'd trust with any of the group's names.
+
+Known limits: the relay can see who's online, when, and how much data moves (not the content). Session labels come from Claude Code's on-disk transcript layout, which isn't a documented API.
 
 ## Roadmap
 
@@ -101,6 +100,7 @@ Design doc: [`docs/superpowers/specs/2026-10-27-claude-share-design.md`](docs/su
 
 MIT licensed.
 
-## Upgrading from 0.1
+## Upgrading
 
-0.2 changes how pairing works, so 0.1 configs aren't compatible. Pair again: one of you runs `claude-share pair --new-group` and the other runs `claude-share join <code>`.
+- **From 0.2:** your pairing still works. Remove any old `claude mcp add claude-share …` entry, add the user-scope one above, and stop running `claude-share up`, since Claude itself is now the client.
+- **From 0.1:** pairing changed, so pair again with `invite_peer` / `join_peer`.

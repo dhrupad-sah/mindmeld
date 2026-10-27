@@ -58,7 +58,10 @@ export function answerWithFork(opts: {
   ].join("\n");
 
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { cwd: opts.cwd, stdio: ["pipe", "pipe", "pipe"] });
+    // Don't leak the parent session's identity into the fork.
+    const env = { ...process.env };
+    for (const k of Object.keys(env)) if (/^CLAUDE_CODE_(SESSION_ID|MESSAGING_)/.test(k)) delete env[k];
+    const child = spawn(bin, args, { cwd: opts.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
     const timer = setTimeout(() => {
