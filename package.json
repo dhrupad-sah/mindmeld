@@ -1,6 +1,6 @@
 {
   "name": "claude-share-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Let two people's Claude Code sessions ask each other questions over LAN or the internet.",
   "type": "module",
   "license": "MIT",
@@ -21,6 +21,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
     "ws": "^8.22.0",
     "zod": "^4.6.7"
   },
@@ -39,5 +41,13 @@
     "collaboration",
     "pair-programming"
   ],
-  "author": "Dhrupad Sah"
+  "author": "Dhrupad Sah",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dhrupad-sah/claude-share.git"
+  },
+  "homepage": "https://github.com/dhrupad-sah/claude-share#readme",
+  "bugs": {
+    "url": "https://github.com/dhrupad-sah/claude-share/issues"
+  }
 }

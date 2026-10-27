@@ -3,7 +3,8 @@ import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 
 export interface Config {
-  code: string;
+  /** 256-bit group secret (hex), handed out during pairing. */
+  secret: string;
   relay: string;
   name: string;
 }
@@ -33,7 +34,14 @@ function writeJson(file: string, value: unknown): void {
   chmodSync(path, 0o600);
 }
 
-export const loadConfig = () => readJson<Config>("config.json");
+export function loadConfig(): Config | null {
+  const c = readJson<Partial<Config> & { code?: string }>("config.json");
+  if (!c) return null;
+  if (!c.secret) {
+    throw new Error("this config is from claude-share 0.1 (code-based pairing). Pair again: `claude-share pair --new-group` or `claude-share join <code>`");
+  }
+  return c as Config;
+}
 export const saveConfig = (c: Config) => writeJson("config.json", c);
 export const loadDaemonInfo = () => readJson<DaemonInfo>("daemon.json");
 export const saveDaemonInfo = (d: DaemonInfo) => writeJson("daemon.json", d);

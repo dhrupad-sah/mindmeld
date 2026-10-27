@@ -69,19 +69,23 @@ Why a separate daemon instead of doing everything in the MCP server: Claude
 Code owns the MCP server's stdio, so it can't prompt the human for approval.
 It also only lives while a session is open.
 
-## Pairing and crypto
+## Pairing and crypto (0.2)
 
-- `claude-share pair` generates a code such as `k7q2-9xmd-4tpa` (12 base32
-  characters, about 60 bits).
-- `roomId = hex(SHA-256("claude-share/room/" + code))` is the only thing the
-  relay sees.
-- `key = scrypt(code, "claude-share/key", 32)`. Each message is
-  `AES-256-GCM(key, nonce=random 12 bytes)`.
-- Codes are saved to `~/.claude-share/config.json` so you pair once.
-- Known limit: a malicious relay operator could brute-force a low-entropy code
-  offline. That's acceptable for the MVP because you run your own relay. The
-  upgrade path is a PAKE (SPAKE2) handshake.
-
+- **Group secret.** `S` is 32 random bytes, created by the first `pair` and stored in
+  `~/.claude-share/config.json` (mode 600). `roomId = SHA-256("claude-share/room/" + hex(S))`
+  is the only thing the relay sees. `key = HKDF-SHA256(S, "claude-share/key")`. Every message is
+  `AES-256-GCM(key, random 12-byte nonce)`.
+- **Invites.** An invite code is `rrrr-pppp-pppp` (base32 without look-alike characters). `rrrr`
+  is a rendezvous id the relay sees, so both sides meet at `/pair/rrrr`. `pppppppp` (~39 bits)
+  is the SPAKE2 password and is never sent.
+- **Handshake.** SPAKE2 (RFC 9382 structure) over ristretto255. M and N come from hash-to-curve
+  of fixed strings. `w = scrypt(password, salt = rendezvous) mod L`. The transcript hash is
+  SHA-512 → Ke (32 bytes) and Ka (32 bytes). Confirmation MACs use HKDF(Ka). The inviter
+  sends `seal(Ke, S)`, and the joiner confirms. A wrong code fails confirmation on both
+  sides and burns the invite, which gives exactly one online guess.
+- **Relay pairing rooms** allow 2 sockets, tell both when the second arrives, and close when
+  either side leaves.
+- 0.1 configs (code-derived keys) are rejected with a re-pair message.
 ## Wire protocol
 
 Relay frames (JSON text):
@@ -106,7 +110,8 @@ A peer is considered offline 60 s after its last `hello`.
 On `ask` addressed to me (or to anyone):
 1. Print the question. Prompt: `[a]uto-answer with Claude  [w]rite reply  [d]ecline`.
    `--auto-approve` skips straight to (2) and also auto-sends.
-2. Run `claude -p --continue --fork-session --output-format text
+2. Run `claude -p (--resume <pinned-or-latest-id> | --continue) --fork-session
+   --no-session-persistence --no-chrome --output-format text
    --allowedTools Read Grep Glob --disallowedTools Bash Edit Write NotebookEdit WebFetch WebSearch
    --strict-mcp-config --mcp-config '{"mcpServers":{}}' --append-system-prompt <peer-guard>`
    (no MCP servers, so a peer's question can't reach the answerer's connectors) in the project directory, with the

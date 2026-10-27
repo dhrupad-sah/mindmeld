@@ -59,7 +59,7 @@ async function guarded(fn: () => Promise<ReturnType<typeof text>>) {
 }
 
 export async function runMcpServer(): Promise<void> {
-  const server = new McpServer({ name: "claude-share", version: "0.1.0" });
+  const server = new McpServer({ name: "claude-share", version: "0.2.0" });
 
   server.registerTool(
     "list_peers",

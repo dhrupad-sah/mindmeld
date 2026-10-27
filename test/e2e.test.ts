@@ -6,7 +6,9 @@ import { answerWithFork } from "../src/answerer.js";
 import { Daemon, type Decide } from "../src/daemon.js";
 import { startRelay } from "../src/relay.js";
 
-const CODE = "abcd-efgh-2345";
+import { generateGroupSecret } from "../src/crypto.js";
+
+const CODE = generateGroupSecret();
 let relay: Server;
 let relayUrl: string;
 const daemons: Daemon[] = [];
@@ -20,7 +22,7 @@ async function waitFor(cond: () => boolean, ms = 3000) {
 }
 
 async function makeDaemon(name: string, decide: Decide, code = CODE, rateLimit?: { max: number; windowMs: number }) {
-  const d = new Daemon({ code, relay: relayUrl, name, project: `${name}-proj`, decide, rateLimit });
+  const d = new Daemon({ secret: code, relay: relayUrl, name, project: `${name}-proj`, decide, rateLimit });
   daemons.push(d);
   const port = await d.start();
   return { d, port };
@@ -80,7 +82,7 @@ describe("end to end", () => {
 
   it("isolates rooms with different codes", async () => {
     const { d: alice } = await makeDaemon("alice", async () => ({ action: "send", text: "" }));
-    await makeDaemon("eve", async () => ({ action: "send", text: "" }), "zzzz-zzzz-zzzz");
+    await makeDaemon("eve", async () => ({ action: "send", text: "" }), generateGroupSecret());
     await new Promise((r) => setTimeout(r, 200));
     expect(alice.onlinePeers()).toEqual([]);
   });
@@ -126,9 +128,18 @@ describe("answerWithFork", () => {
     expect(out.args.slice(0, 3)).toEqual(["-p", "--continue", "--fork-session"]);
     expect(out.args).toEqual(expect.arrayContaining(["--allowedTools", "Read", "Grep", "Glob", "--disallowedTools", "Bash", "Edit", "Write"]));
     expect(out.args).toEqual(expect.arrayContaining(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']));
+    expect(out.args).toEqual(expect.arrayContaining(["--no-session-persistence", "--no-chrome"]));
     expect(out.input).toContain('Question from teammate "alice":\nhow?');
     expect(out.input).toContain("ctx");
     expect(out.cwd).toMatch(/tmp$/);
+  });
+
+  it("resumes a specific session when given one", async () => {
+    process.env.CLAUDE_SHARE_CLAUDE_BIN = stub;
+    const id = "11111111-1111-4111-8111-111111111111";
+    const out = JSON.parse(await answerWithFork({ cwd: "/tmp", from: "a", question: "q", sessionId: id }));
+    expect(out.args.slice(0, 4)).toEqual(["-p", "--resume", id, "--fork-session"]);
+    expect(out.args).not.toContain("--continue");
   });
 
   it("rejects when claude fails", async () => {

@@ -11,20 +11,26 @@ Rules:
 - Be concrete: file paths, function names, commands, and the reasoning behind the approach.`;
 
 /**
- * Answer a peer's question with a headless fork of the most recent Claude Code
- * session in `cwd`. The fork has read-only tools and does not touch the live session.
+ * Answer a peer's question with a headless fork of a Claude Code session in `cwd`:
+ * `sessionId` if given, otherwise the most recent one. The fork has read-only tools,
+ * is never saved to disk, and does not touch the live session.
  */
 export function answerWithFork(opts: {
   cwd: string;
   from: string;
   question: string;
   context?: string;
+  sessionId?: string;
 }): Promise<string> {
   const bin = process.env.CLAUDE_SHARE_CLAUDE_BIN ?? "claude";
   const args = [
     "-p",
-    "--continue",
+    ...(opts.sessionId ? ["--resume", opts.sessionId] : ["--continue"]),
     "--fork-session",
+    // Without this, each fork saves a session of its own, which would then become
+    // "the most recent session" and be forked for the next question.
+    "--no-session-persistence",
+    "--no-chrome",
     "--output-format",
     "text",
     "--allowedTools",

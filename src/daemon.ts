@@ -20,7 +20,8 @@ export interface PeerInfo {
 }
 
 export interface DaemonOptions {
-  code: string;
+  /** Group secret from pairing. */
+  secret: string;
   relay: string;
   name: string;
   project: string;
@@ -52,8 +53,8 @@ export class Daemon extends EventEmitter {
 
   constructor(private readonly opts: DaemonOptions) {
     super();
-    this.key = keyFor(opts.code);
-    this.roomUrl = `${opts.relay.replace(/\/$/, "")}/room/${roomIdFor(opts.code)}`;
+    this.key = keyFor(opts.secret);
+    this.roomUrl = `${opts.relay.replace(/\/$/, "")}/room/${roomIdFor(opts.secret)}`;
   }
 
   async start(): Promise<number> {
