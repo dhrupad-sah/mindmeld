@@ -1,6 +1,6 @@
 {
   "name": "mindmeld-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "mindmeld: let your Claude Code session ask a teammate's Claude Code session questions. E2E encrypted, read-only answers, approved in Claude.",
   "type": "module",
   "license": "MIT",
@@ -46,10 +46,10 @@
   "author": "Dhrupad Sah",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dhrupad-sah/claude-share.git"
+    "url": "git+https://github.com/dhrupad-sah/mindmeld.git"
   },
-  "homepage": "https://github.com/dhrupad-sah/claude-share#readme",
+  "homepage": "https://github.com/dhrupad-sah/mindmeld#readme",
   "bugs": {
-    "url": "https://github.com/dhrupad-sah/claude-share/issues"
+    "url": "https://github.com/dhrupad-sah/mindmeld/issues"
   }
 }

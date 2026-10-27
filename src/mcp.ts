@@ -38,7 +38,7 @@ function ago(ms: number): string {
  * dialogs in that session and answered by a read-only fork of it.
  */
 export async function runMcpServer(): Promise<void> {
-  const server = new McpServer({ name: "mindmeld", version: "0.3.0" });
+  const server = new McpServer({ name: "mindmeld", version: "0.3.1" });
   const cwd = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const mySessionId = process.env.CLAUDE_CODE_SESSION_ID;
   let daemon: Daemon | null = null;
@@ -254,7 +254,7 @@ export async function runMcpServer(): Promise<void> {
           `Invite code: ${code}`,
           "",
           "Tell the user to send their teammate this message:",
-          `  1. Install (once): claude plugin install mindmeld --marketplace dhrupad-sah/claude-share`,
+          `  1. Install (once): claude plugin install mindmeld --marketplace dhrupad-sah/mindmeld`,
           `  2. In Claude Code: /mindmeld:join ${code}`,
           "",
           `The code works once and expires in 15 minutes. Keep this session open until they've joined. You'll appear to them as "${config.name}".`,

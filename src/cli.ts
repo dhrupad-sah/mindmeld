@@ -23,7 +23,7 @@ const USAGE = `mindmeld — let teammates' Claude Code sessions ask each other q
   mindmeld relay [--port 8787]                     self-host a relay (optional; a hosted one is the default)
 
 Easiest: install the Claude Code plugin and do everything from Claude:
-  claude plugin install mindmeld --marketplace dhrupad-sah/claude-share`;
+  claude plugin install mindmeld --marketplace dhrupad-sah/mindmeld`;
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;

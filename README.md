@@ -13,7 +13,7 @@ The answer comes from a **read-only copy of the Claude session your teammate has
 ## Setup (each of you, once)
 
 ```sh
-claude plugin install mindmeld --marketplace dhrupad-sah/claude-share
+claude plugin install mindmeld --marketplace dhrupad-sah/mindmeld
 ```
 
 Restart Claude Code afterwards. The plugin starts its MCP server through `npx`, so the only requirement is Node 20+.
