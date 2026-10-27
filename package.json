@@ -1,0 +1,43 @@
+{
+  "name": "claude-share-mcp",
+  "version": "0.1.0",
+  "description": "Let two people's Claude Code sessions ask each other questions over LAN or the internet.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "claude-share": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "ws": "^8.22.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/ws": "^8.18.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.12"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "mcp-server",
+    "agents",
+    "collaboration",
+    "pair-programming"
+  ],
+  "author": "Dhrupad Sah"
+}
