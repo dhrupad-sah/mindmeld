@@ -31,17 +31,22 @@ claude mcp add -s user mindmeld -- mindmeld mcp
 - **You:** `/mindmeld:invite` (or just say *"invite a teammate to mindmeld"*). Claude gives you a code like `k7q2-9xmd-4tpa` and a message to send. The code works once and expires in 15 minutes.
 - **Them:** `/mindmeld:join k7q2-9xmd-4tpa`. Connected.
 
-From then on you're online whenever you have a Claude Code session open. There's nothing else to run. `/mindmeld:peers` shows who's around.
+Joining exposes nothing. **Every session is private until you share it:**
+
+- **Them, in the session that has the answers:** `/mindmeld:share scraper work`. The group can now see "scraper work" and ask it questions. They see your name, that label and when the session was last active. Never your prompts, files or transcript.
+- `/mindmeld:stop` makes it private again. Closing the session does too.
+- `/mindmeld:peers` lists the sessions people are sharing. `/mindmeld:status` shows whether you're connected, whether this session is shared, who's "always allowed", and every recent question in and out.
 
 ## Use
 
-*"Ask Sarim how they set up the auth middleware."*
+*"Ask Sarim how they set up the auth middleware."* Your Claude shows progress as it happens: delivered → approved → writing the answer. If Sarim's session doesn't acknowledge the question within 15 seconds, you're told right away instead of waiting.
 
-On Sarim's side, Claude Code shows a dialog:
+On Sarim's side, in the session they shared, Claude Code shows a dialog:
 
 ```
 MCP server mindmeld requests your input
-Dhrupad asks: How did you set up the auth middleware?
+Dhrupad asks your shared session "scraper work":
+How did you set up the auth middleware?
 Answer with a read-only copy of this session? You'll see the answer before it's sent.
 (To skip these prompts for Dhrupad, tell Claude "always allow Dhrupad".)
   Accept   Decline
@@ -49,15 +54,17 @@ Answer with a read-only copy of this session? You'll see the answer before it's 
 
 Sarim presses Enter, a read-only copy of that session writes the answer, and a second dialog shows the draft. Another Enter sends it to your Claude. Telling Claude *"always allow Dhrupad"* skips both dialogs for Dhrupad from then on. *"stop allowing Dhrupad"* turns that off.
 
-If Sarim has several Claude sessions open, the question goes to the one used most recently. `list_peers` shows each session and what it's about.
+If Sarim shares several sessions, the question goes to the one used most recently. Every question, including ones answered automatically, is logged in `/mindmeld:status`.
 
 ## Tools Claude gets
 
 | tool | what it does |
 |---|---|
 | `invite_peer` / `join_peer` | pair with a teammate |
+| `share_session` / `stop_sharing` | make this session visible and askable, or private again |
+| `status` | connection, sharing state, trusted people, recent questions |
 | `trust_peer` | always allow, or stop allowing, someone's questions |
-| `list_peers` | who's online, in which project and session |
+| `list_peers` | sessions teammates are sharing |
 | `ask_peer` | ask a question; blocks until the answer arrives |
 | `share_snippet` / `read_inbox` | send or receive code and notes, no reply needed |
 
@@ -80,7 +87,8 @@ By default, both sides connect to a hosted relay (a Cloudflare Worker, source in
 
 - **Pairing via a PAKE handshake.** Invite codes run SPAKE2 over ristretto255. The relay sees only the first 4 characters (a rendezvous id), never the password part. Someone watching, including the relay operator, can't guess the code offline. An attacker gets one live guess, and a wrong guess burns the invite.
 - **End-to-end encrypted.** Pairing hands each member a random 256-bit group secret. Every message is sealed with AES-256-GCM using a key derived from that secret. The relay only sees a room hash and ciphertext, and stores nothing.
-- **Read-only fork.** The answering fork gets only `Read`, `Grep` and `Glob`. There's no Bash, no edits, no web access, no Chrome and **no MCP servers**, so a question can't reach your connectors. Forks are never saved as sessions.
+- **Private by default.** A session is invisible to your group until you run `/mindmeld:share` in it. Sharing reveals only your name, the label you chose and a last-active time. Asking never reveals anything: askers aren't listed at all.
+- **A sandboxed, read-only fork.** Answers come from a copy of the shared session that can only `Read` and `Glob` files **inside that project**. Reads outside it are denied by Claude Code's permission system, and so are `.env*`, keys, `*.pem` and credential files inside it. The fork has no Bash, Grep, edits, web, Chrome or MCP servers. Your own settings are not loaded, so your allow rules can't widen any of this. Forks are never saved as sessions.
 - **You approve.** By default you see every question and every draft answer before it leaves your machine.
 - **Replies are fenced.** Answers reach the asking Claude wrapped in `<peer_reply untrusted="true">` with an instruction to treat them as data.
 - **Rate limited.** At most 10 questions per peer per 10 minutes.

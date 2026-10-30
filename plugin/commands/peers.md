@@ -1,4 +1,4 @@
 ---
-description: See which teammates are online and what their sessions are about
+description: See which sessions your teammates are sharing
 ---
-Use the mindmeld list_peers tool and show me who's online, which project and session each one is in, and how recently they were active.
+Use the mindmeld list_peers tool and show me which sessions teammates are sharing and how recently each was active.

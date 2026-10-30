@@ -25,9 +25,10 @@ async function makeDaemon(
   decide: Decide,
   code = CODE,
   rateLimit?: { max: number; windowMs: number },
-  sessionInfo?: () => { label?: string; activeAt?: number },
+  sessionInfo?: () => { activeAt?: number },
+  share?: { label: string } | null,
 ) {
-  const d = new Daemon({ secret: code, relay: relayUrl, name, project: `${name}-proj`, decide, rateLimit, sessionInfo });
+  const d = new Daemon({ secret: code, relay: relayUrl, name, project: `${name}-proj`, decide, rateLimit, sessionInfo, share });
   daemons.push(d);
   d.start();
   return { d };
@@ -90,10 +91,10 @@ describe("end to end", () => {
   it("routes to the person's most recently active session", async () => {
     const asked: string[] = [];
     const { d: alice } = await makeDaemon("Alice", async () => ({ action: "send", text: "" }));
-    await makeDaemon("Sarim Khan", async () => (asked.push("old"), { action: "send", text: "old" }), CODE, undefined, () => ({ label: "auth work", activeAt: 1000 }));
-    await makeDaemon("Sarim Khan", async () => (asked.push("new"), { action: "send", text: "new" }), CODE, undefined, () => ({ label: "scraper", activeAt: 2000 }));
+    await makeDaemon("Sarim Khan", async () => (asked.push("old"), { action: "send", text: "old" }), CODE, undefined, () => ({ activeAt: 1000 }), { label: "auth work" });
+    await makeDaemon("Sarim Khan", async () => (asked.push("new"), { action: "send", text: "new" }), CODE, undefined, () => ({ activeAt: 2000 }), { label: "scraper" });
     await waitFor(() => alice.onlinePeers().length === 2);
-    expect(alice.onlinePeers().map((p) => p.session).sort()).toEqual(["auth work", "scraper"]);
+    expect(alice.onlinePeers().map((p) => p.project).sort()).toEqual(["auth work", "scraper"]);
     expect(await alice.ask("q", { peer: "sarim" })).toEqual({ from: "Sarim Khan", text: "new" });
     expect(await alice.ask("q")).toEqual({ from: "Sarim Khan", text: "new" }); // one person online: no name needed
     await new Promise((r) => setTimeout(r, 100));
@@ -106,6 +107,57 @@ describe("end to end", () => {
     await makeDaemon("carol", async () => ({ action: "send", text: "" }));
     await waitFor(() => alice.onlinePeers().length === 2);
     expect(await alice.ask("q")).toEqual({ error: expect.stringMatching(/several people are online \((bob, carol|carol, bob)\)/) });
+  });
+
+  it("keeps unshared sessions invisible and unanswerable, and lets them ask silently", async () => {
+    const asked: string[] = [];
+    // alice never shares; bob shares one session and keeps another private
+    const { d: alice } = await makeDaemon("alice", async () => (asked.push("alice"), { action: "send", text: "x" }), CODE, undefined, undefined, null);
+    const { d: bobPrivate } = await makeDaemon("bob", async () => (asked.push("bob-private"), { action: "send", text: "private!" }), CODE, undefined, () => ({ activeAt: 9999 }), null);
+    await makeDaemon("bob", async (ask) => (asked.push(`bob-shared<-${ask.from}`), { action: "send", text: "shared" }), CODE, undefined, () => ({ activeAt: 1 }), { label: "scraper" });
+    await waitFor(() => alice.onlinePeers().length === 1);
+    await new Promise((r) => setTimeout(r, 150));
+    // Only bob's shared session is listed, and only with its chosen label; nobody sees alice.
+    expect(alice.onlinePeers()).toEqual([expect.objectContaining({ name: "bob", project: "scraper" })]);
+    expect(bobPrivate.onlinePeers().map((p) => p.project)).toEqual(["scraper"]);
+    // The question reaches the shared session even though the private one is "more recent".
+    expect(await alice.ask("q", { peer: "bob" })).toEqual({ from: "bob", text: "shared" });
+    expect(asked).toEqual(["bob-shared<-alice"]); // asker's name travels with the question
+  });
+
+  it("stops being visible or answerable after sharing stops", async () => {
+    const { d: alice } = await makeDaemon("alice", async () => ({ action: "send", text: "" }), CODE, undefined, undefined, null);
+    const { d: bob } = await makeDaemon("bob", async () => ({ action: "send", text: "hi" }), CODE, undefined, undefined, { label: "work" });
+    await waitFor(() => alice.onlinePeers().length === 1);
+    bob.setShare(null);
+    await waitFor(() => alice.onlinePeers().length === 0);
+    expect(await alice.ask("q", { peer: "bob" })).toEqual({ error: "no peers online" });
+  });
+
+  it("reports progress while the answer is being prepared", async () => {
+    const { d: alice } = await makeDaemon("alice", async () => ({ action: "send", text: "" }), CODE, undefined, undefined, null);
+    await makeDaemon("bob", async (_ask, report) => {
+      report("approved");
+      await new Promise((r) => setTimeout(r, 30));
+      report("drafting");
+      return { action: "send", text: "done" };
+    });
+    await waitFor(() => alice.onlinePeers().length === 1);
+    const states: string[] = [];
+    expect(await alice.ask("q", { onStatus: (s) => states.push(s) })).toEqual({ from: "bob", text: "done" });
+    expect(states).toEqual(["received", "approved", "drafting"]);
+  });
+
+  it("fails fast when the target session never acknowledges", async () => {
+    const d = new Daemon({ secret: CODE, relay: relayUrl, name: "alice", project: "p", decide: async () => ({ action: "send", text: "" }), share: null, ackTimeoutMs: 300 });
+    daemons.push(d);
+    d.start();
+    const { d: bob } = await makeDaemon("bob", async () => ({ action: "send", text: "" }));
+    await waitFor(() => d.onlinePeers().length === 1);
+    (bob as any).share = null; // vanished without saying bye (e.g. crashed)
+    const started = Date.now();
+    expect(await d.ask("q")).toEqual({ error: expect.stringContaining("didn't acknowledge") });
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 
   it("rate limits a chatty peer", async () => {
@@ -136,7 +188,9 @@ describe("answerWithFork", () => {
     process.env.CLAUDE_SHARE_CLAUDE_BIN = stub;
     const out = JSON.parse(await answerWithFork({ cwd: "/tmp", from: "alice", question: "how?", context: "ctx" }));
     expect(out.args.slice(0, 3)).toEqual(["-p", "--continue", "--fork-session"]);
-    expect(out.args).toEqual(expect.arrayContaining(["--allowedTools", "Read", "Grep", "Glob", "--disallowedTools", "Bash", "Edit", "Write"]));
+    expect(out.args).toEqual(expect.arrayContaining(["--permission-mode", "dontAsk", "--setting-sources", "", "--allowedTools", "Read(./**)", "Glob(./**)"]));
+    expect(out.args).toEqual(expect.arrayContaining(["Read(./**/.env)", "Read(./**/*.pem)", "Bash", "Grep", "Edit", "Write"]));
+    expect(out.args).not.toContain("Read");
     expect(out.args).toEqual(expect.arrayContaining(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']));
     expect(out.args).toEqual(expect.arrayContaining(["--no-session-persistence", "--no-chrome"]));
     expect(out.input).toContain('Question from teammate "alice":\nhow?');

@@ -1,6 +1,6 @@
 {
   "name": "mindmeld",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Ask a teammate's Claude Code session questions and get answers from their session history. End-to-end encrypted; answers come from a read-only copy of their session; they approve each one.",
   "author": {
     "name": "Dhrupad Sah",

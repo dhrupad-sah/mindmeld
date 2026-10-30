@@ -7,10 +7,12 @@ export const Payload = z.discriminatedUnion("type", [
     peer: z.string(),
     name: z.string(),
     project: z.string(),
-    /** Label for the Claude session behind this peer (its first prompt), if known. */
+    /** Label for the shared session, chosen by its owner. */
     session: z.string().optional(),
     /** When that session was last active (ms since epoch); used to route questions. */
     activeAt: z.number().optional(),
+    /** Protocol version (absent before 0.4). */
+    v: z.number().optional(),
   }),
   z.object({ type: z.literal("bye"), peer: z.string() }),
   z.object({
@@ -18,8 +20,16 @@ export const Payload = z.discriminatedUnion("type", [
     id: z.string(),
     from: z.string(),
     to: z.string().optional(),
+    /** Asker's display name; askers don't announce themselves, so it travels with the question. */
+    fromName: z.string().optional(),
     question: z.string(),
     context: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal("status"),
+    id: z.string(),
+    from: z.string(),
+    state: z.enum(["received", "approved", "drafting"]),
   }),
   z.object({ type: z.literal("answer"), id: z.string(), from: z.string(), text: z.string() }),
   z.object({ type: z.literal("decline"), id: z.string(), from: z.string(), reason: z.string() }),
@@ -38,6 +48,7 @@ export type Payload = z.infer<typeof Payload>;
 export const Frame = z.object({ t: z.literal("msg"), d: z.string() });
 export type Frame = z.infer<typeof Frame>;
 
+export const PROTOCOL_VERSION = 2;
 export const HELLO_INTERVAL_MS = 20_000;
 export const PEER_TIMEOUT_MS = 60_000;
 

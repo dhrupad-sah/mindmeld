@@ -1,11 +1,12 @@
-import { basename } from "node:path";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { answerWithFork } from "./answerer.js";
-import { DEFAULT_RELAY, defaultName, loadConfig, saveConfig, type Config } from "./config.js";
+import { DEFAULT_RELAY, defaultName, homeDir, loadConfig, saveConfig, type Config } from "./config.js";
 import { generateGroupSecret, generateInviteCode } from "./crypto.js";
-import { Daemon, type Decide, type Decision } from "./daemon.js";
+import { Daemon, type AskState, type Decide, type Decision } from "./daemon.js";
 import { runInviter, runJoiner } from "./pairing.js";
 import { fenceUntrusted } from "./protocol.js";
 import { listSessions } from "./sessions.js";
@@ -13,6 +14,33 @@ import { listSessions } from "./sessions.js";
 const APPROVAL_TIMEOUT_MS = 10 * 60_000;
 const NOT_PAIRED =
   "Not connected to anyone yet. Use invite_peer to get a code to send a teammate, or join_peer with a code they sent you.";
+
+const NOT_SHARED_HINT = "This session is private. Run /mindmeld:share in it to let your group ask it questions.";
+
+/** Every question this machine handles is logged, so nothing is answered invisibly. */
+type Activity = { at: number; dir: "in" | "out"; peer: string; question: string; outcome: string; session?: string };
+const activityFile = () => join(homeDir(), "activity.jsonl");
+function logActivity(a: Activity) {
+  try {
+    mkdirSync(homeDir(), { recursive: true, mode: 0o700 });
+    appendFileSync(activityFile(), JSON.stringify(a) + "\n", { mode: 0o600 });
+  } catch {
+    // best-effort
+  }
+}
+function recentActivity(n: number): Activity[] {
+  try {
+    return readFileSync(activityFile(), "utf8").trim().split("\n").slice(-n).map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
+
+const STATE_TEXT: Record<AskState, string> = {
+  received: "delivered; waiting for them to approve",
+  approved: "approved; their session is writing the answer",
+  drafting: "answer drafted; waiting for them to approve sending it",
+};
 
 const text = (t: string, isError = false) => ({ content: [{ type: "text" as const, text: t }], isError });
 
@@ -38,10 +66,12 @@ function ago(ms: number): string {
  * dialogs in that session and answered by a read-only fork of it.
  */
 export async function runMcpServer(): Promise<void> {
-  const server = new McpServer({ name: "mindmeld", version: "0.3.1" });
+  const server = new McpServer({ name: "mindmeld", version: "0.4.0" });
   const cwd = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const mySessionId = process.env.CLAUDE_CODE_SESSION_ID;
   let daemon: Daemon | null = null;
+  // Private until the user explicitly shares this session; never persisted across sessions.
+  let share: { label: string } | null = null;
 
   /** This session's transcript; after /clear the id may be stale, so fall back to the newest. */
   const mySession = () => {
@@ -63,20 +93,27 @@ export async function runMcpServer(): Promise<void> {
 
   // One question at a time, so approval dialogs never stack up.
   let queue: Promise<unknown> = Promise.resolve();
-  const decide: Decide = (ask) => {
-    const run = queue.then(() => answer(ask));
+  const decide: Decide = (ask, report) => {
+    const run = queue.then(() => answer(ask, report));
     queue = run.catch(() => {});
     return run;
   };
 
-  async function answer(ask: { from: string; question: string; context?: string }): Promise<Decision> {
+  async function answer(ask: { from: string; question: string; context?: string }, report: (s: AskState) => void): Promise<Decision> {
+    const d = await answerInner(ask, report);
+    logActivity({ at: Date.now(), dir: "in", peer: ask.from, question: ask.question.slice(0, 200), session: share?.label,
+      outcome: d.action === "send" ? (isTrusted(ask.from) ? "answered automatically (always allowed)" : "answered") : `declined: ${d.reason}` });
+    return d;
+  }
+
+  async function answerInner(ask: { from: string; question: string; context?: string }, report: (s: AskState) => void): Promise<Decision> {
     const trusted = isTrusted(ask.from);
     if (!trusted) {
       if (!server.server.getClientCapabilities()?.elicitation) {
         return { action: "decline", reason: "they can't approve questions right now (no interactive Claude session)" };
       }
       const asked = [
-        `${ask.from} asks:`,
+        `${ask.from} asks your shared session "${share?.label ?? basename(cwd)}":`,
         "",
         ask.question.slice(0, 2000),
         ask.context ? `\nTheir context: ${ask.context.slice(0, 1000)}` : "",
@@ -88,6 +125,7 @@ export async function runMcpServer(): Promise<void> {
       const r = await elicit(asked, { type: "object", properties: {} });
       if (r.action !== "accept") return { action: "decline", reason: "declined" };
     }
+    report("approved");
 
     const draft = await answerWithFork({
       cwd,
@@ -97,6 +135,7 @@ export async function runMcpServer(): Promise<void> {
       sessionId: mySession()?.id,
     });
     if (trusted) return { action: "send", text: draft };
+    report("drafting");
 
     const r = await elicit(`Send this answer to ${ask.from}?\n\n${draft.slice(0, 8000)}`, {
       type: "object",
@@ -110,10 +149,12 @@ export async function runMcpServer(): Promise<void> {
     daemon = new Daemon({
       ...config,
       project: basename(cwd),
+      share,
       decide,
+      // Only a timestamp, for routing: never the transcript or its first prompt.
       sessionInfo: () => {
         const s = mySession();
-        return s ? { label: s.firstPrompt.slice(0, 80), activeAt: s.modified.getTime() } : {};
+        return s ? { activeAt: s.modified.getTime() } : {};
       },
     });
     daemon.start();
@@ -126,18 +167,14 @@ export async function runMcpServer(): Promise<void> {
     "list_peers",
     {
       title: "List peers",
-      description: "List teammates connected through mindmeld right now, one line per open Claude session.",
+      description: "List the sessions teammates are sharing through mindmeld right now (only shared sessions are visible).",
       inputSchema: {},
     },
     async () => {
       if (!daemon) return text(NOT_PAIRED);
       const peers = daemon.onlinePeers();
-      if (peers.length === 0) return text("Nobody is online right now. They're online whenever they have a Claude Code session open.");
-      return text(
-        peers
-          .map((p) => `- ${p.name}: ${p.project}${p.session ? ` · "${p.session}"` : ""}${p.activeAt ? ` · active ${ago(p.activeAt)}` : ""}`)
-          .join("\n"),
-      );
+      if (peers.length === 0) return text("Nobody is sharing a session right now. Teammates appear here after they run /mindmeld:share.");
+      return text(peers.map((p) => `- ${p.name}: "${p.project}"${p.activeAt ? ` · active ${ago(p.activeAt)}` : ""}`).join("\n"));
     },
   );
 
@@ -147,8 +184,8 @@ export async function runMcpServer(): Promise<void> {
       title: "Ask a teammate's Claude",
       description:
         "Ask a teammate's Claude Code session a question, e.g. how they solved something or how part of their work functions. " +
-        "It goes to their most recently active session; they approve it in their Claude, and a read-only copy of that session answers. " +
-        "Blocks until the answer arrives (can take a few minutes). Make the question self-contained.",
+        "It goes to their most recently active shared session; they approve it in their Claude, and a read-only copy of that session answers. " +
+        "Reports progress while waiting (delivered, approved, drafting). Can take a few minutes. Make the question self-contained.",
       inputSchema: {
         question: z.string().describe("The question, self-contained"),
         peer: z.string().optional().describe("Who to ask (name or first name). Optional if only one person is online"),
@@ -156,9 +193,19 @@ export async function runMcpServer(): Promise<void> {
         timeout_sec: z.number().int().min(10).max(3600).optional().describe("Default 600"),
       },
     },
-    async ({ question, peer, context, timeout_sec }) => {
+    async ({ question, peer, context, timeout_sec }, extra) => {
       if (!daemon) return text(NOT_PAIRED, true);
-      const r = await daemon.ask(question, { peer, context, timeoutSec: timeout_sec });
+      const token = extra._meta?.progressToken;
+      let step = 0;
+      const progress = (message: string) => {
+        step++;
+        if (token !== undefined) {
+          void extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: step, total: 4, message } });
+        }
+      };
+      progress("sending");
+      const r = await daemon.ask(question, { peer, context, timeoutSec: timeout_sec, onStatus: (s) => progress(STATE_TEXT[s]) });
+      logActivity({ at: Date.now(), dir: "out", peer: "error" in r ? (peer ?? "?") : r.from, question: question.slice(0, 200), outcome: "error" in r ? r.error : "answered" });
       if ("error" in r) return text(`No answer: ${r.error}`, true);
       return text(fenceUntrusted(r.from, r.text));
     },
@@ -194,6 +241,75 @@ export async function runMcpServer(): Promise<void> {
       const items = daemon.drainInbox();
       if (items.length === 0) return text("Inbox is empty.");
       return text(items.map((i) => fenceUntrusted(i.from, `# ${i.title}\n${i.text}`)).join("\n\n"));
+    },
+  );
+
+  server.registerTool(
+    "share_session",
+    {
+      title: "Share this session",
+      description:
+        "Let the user's mindmeld group see this Claude session and ask it questions (each question still needs the user's approval " +
+        "unless they've 'always allowed' someone). Only call this when the user asks to share. Sessions are private by default.",
+      inputSchema: {
+        label: z.string().max(60).optional().describe("What teammates will see this session as. Defaults to the project folder name"),
+      },
+    },
+    async ({ label }) => {
+      if (!daemon) return text(NOT_PAIRED, true);
+      share = { label: (label ?? basename(cwd)).trim() || basename(cwd) };
+      daemon.setShare(share);
+      return text(
+        [
+          `This session is now shared with your mindmeld group as "${share.label}".`,
+          `They can see: your name ("${loadConfigOrNull()?.name}"), the label "${share.label}", and when the session was last active. Nothing else: not your prompts, files or transcript.`,
+          "Each question shows an Accept/Decline dialog here, and answers come from a read-only copy of this session that can only read files inside this project (never .env or key files).",
+          "Run /mindmeld:stop to stop sharing. Closing this session stops it too.",
+        ].join("\n"),
+      );
+    },
+  );
+
+  server.registerTool(
+    "stop_sharing",
+    {
+      title: "Stop sharing this session",
+      description: "Make this session private again: teammates can no longer see it or ask it questions.",
+      inputSchema: {},
+    },
+    async () => {
+      if (!daemon || !share) return text("This session isn't shared.");
+      share = null;
+      daemon.setShare(null);
+      return text("This session is private again. Teammates can no longer see it or ask it questions.");
+    },
+  );
+
+  server.registerTool(
+    "status",
+    {
+      title: "mindmeld status",
+      description: "Show the user's mindmeld status: connection, whether this session is shared, who's sharing, trusted people, and recent questions.",
+      inputSchema: {},
+    },
+    async () => {
+      const c = loadConfigOrNull();
+      if (!c || !daemon) return text(NOT_PAIRED);
+      const peers = daemon.onlinePeers();
+      const lines = [
+        `Connection: ${daemon.connected ? "connected" : "NOT connected (reconnecting to the relay)"}`,
+        `You appear as: ${c.name}`,
+        `This session: ${share ? `shared as "${share.label}"` : "private (not visible to anyone). Run /mindmeld:share to share it."}`,
+        `Sharing now: ${peers.length ? peers.map((p) => `${p.name} ("${p.project}")`).join(", ") : "nobody"}`,
+        `Always allowed (answered without dialogs): ${c.trusted?.length ? c.trusted.join(", ") : "nobody"}`,
+        "",
+        "Recent questions on this machine:",
+        ...(recentActivity(10).reverse().map((a) =>
+          `- ${new Date(a.at).toLocaleString()} ${a.dir === "in" ? `${a.peer} asked${a.session ? ` "${a.session}"` : ""}` : `you asked ${a.peer}`}: "${a.question}" → ${a.outcome}`,
+        ) || []),
+      ];
+      if (lines[lines.length - 1] === "Recent questions on this machine:") lines.push("- none yet");
+      return text(lines.join("\n"));
     },
   );
 
@@ -258,6 +374,8 @@ export async function runMcpServer(): Promise<void> {
           `  2. In Claude Code: /mindmeld:join ${code}`,
           "",
           `The code works once and expires in 15 minutes. Keep this session open until they've joined. You'll appear to them as "${config.name}".`,
+          "",
+          "Joining doesn't expose any of your sessions: each session stays private until you run /mindmeld:share in it.",
         ].join("\n"),
       );
     },
@@ -284,7 +402,8 @@ export async function runMcpServer(): Promise<void> {
         connect(config);
         return text(
           `Connected to ${inviterName}'s group as "${name}". ` +
-            `Ask them anything with ask_peer, e.g. "ask ${inviterName.split(/\s+/)[0]} how they built X".` +
+            `You can ask any session they share, e.g. "ask ${inviterName.split(/\s+/)[0]} how they built X". ` +
+            "Your own sessions stay private until you run /mindmeld:share in one." +
             (prev && prev.secret !== secret ? " (This replaced the group this machine was in before.)" : ""),
         );
       } catch (e) {

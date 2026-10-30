@@ -28,7 +28,7 @@ interface Conn {
   early: string[];
 }
 
-function connect(relay: string, rendezvous: string): Promise<Conn> {
+function connectOnce(relay: string, rendezvous: string): Promise<Conn> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`${relay.replace(/\/$/, "")}/pair/${rendezvous}`);
     const early: string[] = [];
@@ -36,12 +36,29 @@ function connect(relay: string, rendezvous: string): Promise<Conn> {
     ws.on("message", buffer);
     ws.once("open", () => resolve({ ws, early }));
     ws.once("unexpected-response", (_req, res) =>
-      reject(new Error(res.statusCode === 409 ? "this invite is already in use" : `relay rejected pairing (${res.statusCode})`)),
+      reject(
+        Object.assign(
+          new Error(res.statusCode === 409 ? "this invite is already in use" : `relay rejected pairing (${res.statusCode})`),
+          { retryable: (res.statusCode ?? 0) >= 500 },
+        ),
+      ),
     );
     ws.once("error", (e: NodeJS.ErrnoException) =>
-      reject(new Error(`can't reach relay ${relay}: ${e.message || e.code || "connection failed"}`)),
+      reject(Object.assign(new Error(`can't reach relay ${relay}: ${e.message || e.code || "connection failed"}`), { retryable: true })),
     );
   });
+}
+
+/** Flaky networks and transient relay errors shouldn't kill a one-time invite: retry a few times. */
+async function connect(relay: string, rendezvous: string): Promise<Conn> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await connectOnce(relay, rendezvous);
+    } catch (e) {
+      if (!(e as { retryable?: boolean }).retryable || attempt >= 4) throw e;
+      await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
+    }
+  }
 }
 
 function run<T>(

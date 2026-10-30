@@ -2,12 +2,8 @@
   "mcpServers": {
     "mindmeld": {
       "type": "stdio",
-      "command": "npx",
-      "args": [
-        "-y",
-        "mindmeld-mcp@^0.3.0",
-        "mcp"
-      ]
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/launcher.mjs"]
     }
   }
 }

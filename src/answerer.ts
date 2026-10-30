@@ -2,6 +2,9 @@ import { spawn } from "node:child_process";
 
 const FORK_TIMEOUT_MS = 5 * 60_000;
 
+/** Files a fork may never read, even inside the project. */
+export const SECRET_PATTERNS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "id_rsa*", "id_ed25519*", "id_ecdsa*", ".npmrc", ".netrc", "*credentials*", "*secret*", ".git/config"];
+
 const PEER_GUARD = `A teammate's Claude Code session is asking you a question through mindmeld.
 Answer it from what you know in this session: what was built, how problems were solved, and why.
 Rules:
@@ -33,17 +36,26 @@ export function answerWithFork(opts: {
     "--no-chrome",
     "--output-format",
     "text",
+    // Sandbox: files inside the project only, never secrets, and nothing else. dontAsk denies
+    // anything not allowed here; ignoring setting sources stops the user's own allow rules
+    // (or hooks) from widening it. No Grep: a search could surface text from secret files.
+    "--permission-mode",
+    "dontAsk",
+    "--setting-sources",
+    "",
     "--allowedTools",
-    "Read",
-    "Grep",
-    "Glob",
+    "Read(./**)",
+    "Glob(./**)",
     "--disallowedTools",
+    ...SECRET_PATTERNS.map((p) => `Read(./**/${p})`),
     "Bash",
+    "Grep",
     "Edit",
     "Write",
     "NotebookEdit",
     "WebFetch",
     "WebSearch",
+    "Task",
     // No MCP servers in the fork: a peer's question must not reach the answerer's connectors.
     "--strict-mcp-config",
     "--mcp-config",

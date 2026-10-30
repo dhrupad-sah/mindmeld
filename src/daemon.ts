@@ -2,14 +2,16 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import WebSocket from "ws";
 import { keyFor, open, roomIdFor, seal } from "./crypto.js";
-import { Frame, HELLO_INTERVAL_MS, PEER_TIMEOUT_MS, Payload } from "./protocol.js";
+import { Frame, HELLO_INTERVAL_MS, PEER_TIMEOUT_MS, Payload, PROTOCOL_VERSION } from "./protocol.js";
 
 type Ask = Extract<Payload, { type: "ask" }>;
 type Snippet = Extract<Payload, { type: "snippet" }>;
 
 export type Decision = { action: "send"; text: string } | { action: "decline"; reason: string };
 /** Decides how to respond to an incoming question (interactive prompt, auto-fork, or test stub). */
-export type Decide = (ask: Ask) => Promise<Decision>;
+export type AskState = Extract<Payload, { type: "status" }>["state"];
+export type Decide = (ask: Ask, report: (state: AskState) => void) => Promise<Decision>;
+export type AskResult = { from: string; text: string } | { error: string };
 
 export interface PeerInfo {
   peer: string;
@@ -17,6 +19,7 @@ export interface PeerInfo {
   project: string;
   session?: string;
   activeAt?: number;
+  v?: number;
   lastSeen: number;
 }
 
@@ -28,12 +31,21 @@ export interface DaemonOptions {
   project: string;
   decide: Decide;
   /** Describes the Claude session behind this daemon, re-read on every hello. */
-  sessionInfo?: () => { label?: string; activeAt?: number };
+  sessionInfo?: () => { activeAt?: number };
+  /**
+   * Shared sessions are listed to the group and can be asked questions. Unshared ones are
+   * invisible: they can still ask, but never announce themselves or answer. Default: shared.
+   */
+  share?: { label: string } | null;
+  /** How long an ask waits for the target to acknowledge before failing (v2+ peers). */
+  ackTimeoutMs?: number;
   rateLimit?: { max: number; windowMs: number };
 }
 
 interface PendingAsk {
-  resolve: (r: { from: string; text: string } | { error: string }) => void;
+  resolve: (r: AskResult) => void;
+  onStatus?: (state: AskState) => void;
+  acked: boolean;
   expected: number;
   declines: string[];
 }
@@ -49,9 +61,11 @@ export class Daemon extends EventEmitter {
   private readonly pending = new Map<string, PendingAsk>();
   private readonly inbox: Snippet[] = [];
   private readonly askLog = new Map<string, number[]>();
+  private share: { label: string } | null;
 
   constructor(private readonly opts: DaemonOptions) {
     super();
+    this.share = opts.share === undefined ? { label: opts.project } : opts.share;
     this.key = keyFor(opts.secret);
     this.roomUrl = `${opts.relay.replace(/\/$/, "")}/room/${roomIdFor(opts.secret)}`;
   }
@@ -98,8 +112,25 @@ export class Daemon extends EventEmitter {
     this.ws.send(JSON.stringify(frame));
   }
 
+  get connected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  get sharing(): { label: string } | null {
+    return this.share;
+  }
+
+  /** Start or stop sharing this session with the group. */
+  setShare(share: { label: string } | null): void {
+    const was = this.share;
+    this.share = share;
+    if (share) this.sendHello();
+    else if (was) this.send({ type: "bye", peer: this.peerId });
+  }
+
   private sendHello(): void {
-    let info: { label?: string; activeAt?: number } = {};
+    if (!this.share) return; // unshared sessions never announce themselves
+    let info: { activeAt?: number } = {};
     try {
       info = this.opts.sessionInfo?.() ?? {};
     } catch {
@@ -109,9 +140,9 @@ export class Daemon extends EventEmitter {
       type: "hello",
       peer: this.peerId,
       name: this.opts.name,
-      project: this.opts.project,
-      session: info.label,
+      project: this.share.label,
       activeAt: info.activeAt,
+      v: PROTOCOL_VERSION,
     });
   }
 
@@ -137,6 +168,7 @@ export class Daemon extends EventEmitter {
           project: p.project,
           session: p.session,
           activeAt: p.activeAt,
+          v: p.v,
           lastSeen: Date.now(),
         });
         if (isNew) {
@@ -152,8 +184,17 @@ export class Daemon extends EventEmitter {
         break;
       }
       case "ask":
-        if (!p.to || p.to === this.opts.name || p.to === this.peerId) void this.handleAsk(p);
+        // Only a shared session answers, and only questions addressed to it (or legacy broadcasts).
+        if (this.share && (!p.to || p.to === this.opts.name || p.to === this.peerId)) void this.handleAsk(p);
         break;
+      case "status": {
+        const pending = this.pending.get(p.id);
+        if (pending) {
+          pending.acked = true;
+          pending.onStatus?.(p.state);
+        }
+        break;
+      }
       case "answer": {
         const pending = this.pending.get(p.id);
         if (pending) {
@@ -181,8 +222,8 @@ export class Daemon extends EventEmitter {
     }
   }
 
-  private nameOf(peerId: string): string {
-    return this.peers.get(peerId)?.name ?? peerId.slice(0, 8);
+  private nameOf(peerId: string, fallback?: string): string {
+    return this.peers.get(peerId)?.name ?? fallback ?? peerId.slice(0, 8);
   }
 
   private rateLimited(from: string): boolean {
@@ -194,18 +235,28 @@ export class Daemon extends EventEmitter {
     return recent.length > max;
   }
 
+  private readonly seenAsks = new Set<string>();
+
   private async handleAsk(ask: Ask): Promise<void> {
+    if (this.seenAsks.has(ask.id)) return; // a resend of a question already being handled
+    this.seenAsks.add(ask.id);
     const reply = (d: Decision) =>
       d.action === "send"
         ? this.send({ type: "answer", id: ask.id, from: this.peerId, text: d.text })
         : this.send({ type: "decline", id: ask.id, from: this.peerId, reason: d.reason });
 
+    const report = (state: AskState) => this.send({ type: "status", id: ask.id, from: this.peerId, state });
+    report("received");
     if (this.rateLimited(ask.from)) {
       reply({ action: "decline", reason: "rate limited — too many questions, try again later" });
       return;
     }
+    const from = this.nameOf(ask.from, ask.fromName);
+    this.emit("question", { from, question: ask.question });
     try {
-      reply(await this.opts.decide({ ...ask, from: this.nameOf(ask.from) }));
+      const d = await this.opts.decide({ ...ask, from }, report);
+      this.emit("handled", { from, question: ask.question, action: d.action });
+      reply(d);
     } catch (e) {
       reply({ action: "decline", reason: `failed to answer: ${(e as Error).message}` });
     }
@@ -239,25 +290,40 @@ export class Daemon extends EventEmitter {
     return matches.reduce((best, p) => ((p.activeAt ?? 0) > (best.activeAt ?? 0) ? p : best));
   }
 
-  ask(question: string, opts: { peer?: string; context?: string; timeoutSec?: number } = {}) {
+  ask(
+    question: string,
+    opts: { peer?: string; context?: string; timeoutSec?: number; onStatus?: (state: AskState) => void } = {},
+  ): Promise<AskResult> {
+    if (!this.connected) return Promise.resolve({ error: "not connected to the relay right now; try again in a moment" });
     const target = this.route(opts.peer);
     if ("error" in target) return Promise.resolve(target);
     const id = randomUUID();
     const timeoutSec = opts.timeoutSec ?? 600;
-    return new Promise<{ from: string; text: string } | { error: string }>((resolve) => {
-      const timer = setTimeout(() => {
+    return new Promise<AskResult>((resolve) => {
+      const timers: NodeJS.Timeout[] = [];
+      const finish = (r: AskResult) => {
+        timers.forEach(clearTimeout);
         this.pending.delete(id);
-        resolve({ error: `no answer within ${timeoutSec}s` });
-      }, timeoutSec * 1000);
-      this.pending.set(id, {
-        expected: 1,
-        declines: [],
-        resolve: (r) => {
-          clearTimeout(timer);
-          resolve(r);
-        },
-      });
-      this.send({ type: "ask", id, from: this.peerId, to: target.peer, question, context: opts.context });
+        resolve(r);
+      };
+      timers.push(setTimeout(() => finish({ error: `no answer within ${timeoutSec}s` }), timeoutSec * 1000));
+      // Peers from 0.4 on acknowledge at once; older ones don't, so only hold newer ones to it.
+      const payload: Payload = { type: "ask", id, from: this.peerId, fromName: this.opts.name, to: target.peer, question, context: opts.context };
+      if ((target.v ?? 0) >= 2) {
+        // Not acknowledged halfway through the window: resend once (a frame can be lost while
+        // the socket reconnects). The answering side ignores duplicate ids.
+        const ackMs = this.opts.ackTimeoutMs ?? 15_000;
+        timers.push(setTimeout(() => !this.pending.get(id)?.acked && this.send(payload), ackMs / 2));
+        timers.push(
+          setTimeout(() => {
+            if (!this.pending.get(id)?.acked) {
+              finish({ error: `${target.name}'s session didn't acknowledge the question. It may have just closed or stopped sharing.` });
+            }
+          }, ackMs),
+        );
+      }
+      this.pending.set(id, { resolve: finish, onStatus: opts.onStatus, acked: false, expected: 1, declines: [] });
+      this.send(payload);
     });
   }
 

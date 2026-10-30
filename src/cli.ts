@@ -66,7 +66,7 @@ async function main() {
       console.log(`Send your friend:  mindmeld join ${code}${relayHint}\n`);
       console.log(dim("waiting for them to join… (keep this running)"));
       const { peerName } = await runInviter({ relay: config.relay, code, secret: config.secret, name: config.name });
-      console.log(`${cyan("✓")} paired with ${bold(peerName)}. Next: ${bold("mindmeld up")} in your project directory.`);
+      console.log(`${cyan("✓")} paired with ${bold(peerName)}. In Claude Code, run ${bold("/mindmeld:share")} in a session to let them ask it.`);
       return;
     }
     case "join": {
@@ -78,7 +78,7 @@ async function main() {
       const { secret, inviterName } = await runJoiner({ relay, code, name });
       saveConfig({ secret, relay, name });
       console.log(`${cyan("✓")} joined ${bold(inviterName)}'s group as ${bold(name)}.`);
-      console.log(`Next: run ${bold("mindmeld up")} in your project directory.`);
+      console.log(`Next: in Claude Code, run ${bold("/mindmeld:share")} in a session to let them ask it (sessions are private by default).`);
       return;
     }
     case "sessions": {
