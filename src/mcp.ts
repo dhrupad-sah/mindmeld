@@ -66,7 +66,7 @@ function ago(ms: number): string {
  * dialogs in that session and answered by a read-only fork of it.
  */
 export async function runMcpServer(): Promise<void> {
-  const server = new McpServer({ name: "mindmeld", version: "0.4.0" });
+  const server = new McpServer({ name: "mindmeld", version: "0.4.1" });
   const cwd = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const mySessionId = process.env.CLAUDE_CODE_SESSION_ID;
   let daemon: Daemon | null = null;
