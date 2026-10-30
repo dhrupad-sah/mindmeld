@@ -16,7 +16,7 @@ The answer comes from a **read-only copy of the Claude session your teammate has
 claude plugin install mindmeld --marketplace dhrupad-sah/mindmeld
 ```
 
-Restart Claude Code afterwards. The plugin starts its MCP server through `npx`, so the only requirement is Node 20+.
+Restart Claude Code afterwards. The server is bundled into the plugin, so there's nothing else to download. The only requirement is Node 20+.
 
 <details><summary>Without the plugin</summary>
 

@@ -53,8 +53,8 @@ fixed in 0.4.0; the others are tracked here.
 9. After `/clear` the session id changes but the MCP server keeps the old one. The answer then
    comes from the pre-clear history. *Open:* SessionStart hook to refresh it.
 10. Large answers can exceed the relay's 1 MB frame limit. *Open:* cap and truncate with a notice.
-11. The first `npx` start can be slow on a cold cache. *Open:* measure, or bundle the server into
-    the plugin.
+11. ~~The first `npx` start outlasted Claude Code's startup check, so the first launch failed.~~
+    **Fixed in plugin 0.4.1:** the server is bundled into the plugin and starts in about 1 s cold.
 
 ## P2: product
 
