@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 
@@ -50,6 +50,14 @@ export function loadConfig(): Config | null {
   return c as Config;
 }
 export const saveConfig = (c: Config) => writeJson("config.json", c);
+
+/** Leave the group: forget the group secret (and the legacy copy, so it isn't migrated back). */
+export function deleteConfig(): void {
+  rmSync(join(homeDir(), "config.json"), { force: true });
+  if (!process.env.MINDMELD_HOME && !process.env.CLAUDE_SHARE_HOME) {
+    rmSync(join(homedir(), ".claude-share", "config.json"), { force: true });
+  }
+}
 
 /** Hosted relay (Cloudflare Worker, relay-worker/). It only ever sees ciphertext. Override with --relay or MINDMELD_RELAY. */
 export const DEFAULT_RELAY = process.env.MINDMELD_RELAY ?? process.env.CLAUDE_SHARE_RELAY ?? "wss://claude-share-relay.thedhrupad.workers.dev";

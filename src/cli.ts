@@ -4,7 +4,7 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { answerWithFork } from "./answerer.js";
 import { generateGroupSecret, generateInviteCode } from "./crypto.js";
-import { DEFAULT_RELAY, defaultName, loadConfig, saveConfig, type Config } from "./config.js";
+import { DEFAULT_RELAY, defaultName, deleteConfig, loadConfig, saveConfig, type Config } from "./config.js";
 import { Daemon, type Decide, type Decision } from "./daemon.js";
 import { runMcpServer } from "./mcp.js";
 import { runInviter, runJoiner } from "./pairing.js";
@@ -18,6 +18,7 @@ const USAGE = `mindmeld — let teammates' Claude Code sessions ask each other q
   mindmeld join  <code> [--name bob]               join with a friend's invite code
   mindmeld up    [--session <id|latest>] [--auto-approve]
                                                        run the daemon (in your project dir)
+  mindmeld leave     [-y]                             leave your group (disconnects every session here)
   mindmeld sessions                                list Claude sessions in this directory
   mindmeld mcp                                     MCP server (used by Claude Code)
   mindmeld relay [--port 8787]                     self-host a relay (optional; a hosted one is the default)
@@ -41,6 +42,7 @@ async function main() {
       "auto-approve": { type: "boolean" },
       "new-group": { type: "boolean" },
       session: { type: "string" },
+      yes: { type: "boolean", short: "y" },
     },
   });
 
@@ -79,6 +81,21 @@ async function main() {
       saveConfig({ secret, relay, name });
       console.log(`${cyan("✓")} joined ${bold(inviterName)}'s group as ${bold(name)}.`);
       console.log(`Next: in Claude Code, run ${bold("/mindmeld:share")} in a session to let them ask it (sessions are private by default).`);
+      return;
+    }
+    case "leave": {
+      if (!loadConfigOrNull()) {
+        console.log("You're not in a mindmeld group.");
+        return;
+      }
+      if (!values.yes) {
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const a = (await rl.question("Leave your mindmeld group? Every session on this machine disconnects, and you'll need a new invite to reconnect. [y/N] ")).trim().toLowerCase();
+        rl.close();
+        if (a !== "y" && a !== "yes") return;
+      }
+      deleteConfig();
+      console.log(`${cyan("✓")} left the group. Open Claude sessions disconnect within a few seconds.`);
       return;
     }
     case "sessions": {

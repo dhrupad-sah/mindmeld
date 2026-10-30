@@ -35,6 +35,7 @@ Joining exposes nothing. **Every session is private until you share it:**
 
 - **Them, in the session that has the answers:** `/mindmeld:share scraper work`. The group can now see "scraper work" and ask it questions. They see your name, that label and when the session was last active. Never your prompts, files or transcript.
 - `/mindmeld:stop` makes it private again. Closing the session does too.
+- `/mindmeld:leave` leaves the group entirely. Every session on this machine disconnects and the pairing is deleted, after a confirmation. To reconnect you'll need a new invite.
 - `/mindmeld:peers` lists the sessions people are sharing. `/mindmeld:status` shows whether you're connected, whether this session is shared, who's "always allowed", and every recent question in and out.
 
 ## Use
@@ -63,10 +64,15 @@ If Sarim shares several sessions, the question goes to the one used most recentl
 | `invite_peer` / `join_peer` | pair with a teammate |
 | `share_session` / `stop_sharing` | make this session visible and askable, or private again |
 | `status` | connection, sharing state, trusted people, recent questions |
+| `leave_group` | leave the group and disconnect every session on this machine |
 | `trust_peer` | always allow, or stop allowing, someone's questions |
 | `list_peers` | sessions teammates are sharing |
 | `ask_peer` | ask a question; blocks until the answer arrives |
 | `share_snippet` / `read_inbox` | send or receive code and notes, no reply needed |
+
+### Removing someone from a group
+
+Everyone in a group shares one key, so you can't remove one person on their own. Instead, the rest of you run `/mindmeld:leave` and pair again with a fresh `/mindmeld:invite`. That creates a new key the removed person doesn't have.
 
 ## Terminal commands (optional)
 
@@ -75,6 +81,7 @@ Everything above works from inside Claude. The CLI is there for scripts and serv
 ```sh
 mindmeld pair / join <code>     # pair from a terminal instead
 mindmeld up --auto-approve      # an always-on answerer for a project (no dialogs; trusted groups only)
+mindmeld leave                  # leave your group (asks to confirm; -y to skip)
 mindmeld sessions               # list Claude sessions in this directory
 mindmeld relay                  # self-host a relay
 ```

@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "mindmeld",
-      "version": "0.4.1",
+      "version": "0.4.2",
       "source": "./plugin",
       "description": "Ask a teammate's Claude Code session questions. E2E encrypted, read-only answers, approved in Claude."
     }

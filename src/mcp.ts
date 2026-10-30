@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { answerWithFork } from "./answerer.js";
-import { DEFAULT_RELAY, defaultName, homeDir, loadConfig, saveConfig, type Config } from "./config.js";
+import { DEFAULT_RELAY, defaultName, deleteConfig, homeDir, loadConfig, saveConfig, type Config } from "./config.js";
 import { generateGroupSecret, generateInviteCode } from "./crypto.js";
 import { Daemon, type AskState, type Decide, type Decision } from "./daemon.js";
 import { runInviter, runJoiner } from "./pairing.js";
@@ -66,7 +66,7 @@ function ago(ms: number): string {
  * dialogs in that session and answered by a read-only fork of it.
  */
 export async function runMcpServer(): Promise<void> {
-  const server = new McpServer({ name: "mindmeld", version: "0.4.1" });
+  const server = new McpServer({ name: "mindmeld", version: "0.4.2" });
   const cwd = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const mySessionId = process.env.CLAUDE_CODE_SESSION_ID;
   let daemon: Daemon | null = null;
@@ -160,8 +160,27 @@ export async function runMcpServer(): Promise<void> {
     daemon.start();
   }
 
+  function disconnect() {
+    void daemon?.stop();
+    daemon = null;
+    share = null;
+  }
+
   const existing = loadConfigOrNull();
   if (existing) connect(existing);
+
+  // Every open session holds its own connection. If the group changes elsewhere (left, or
+  // re-paired from another session or the CLI), follow it here within a few seconds.
+  let knownSecret = existing?.secret ?? null;
+  const watch = setInterval(() => {
+    const c = loadConfigOrNull();
+    const secret = c?.secret ?? null;
+    if (secret === knownSecret) return;
+    knownSecret = secret;
+    if (c) connect(c);
+    else disconnect();
+  }, 3000);
+  watch.unref();
 
   server.registerTool(
     "list_peers",
@@ -310,6 +329,41 @@ export async function runMcpServer(): Promise<void> {
       ];
       if (lines[lines.length - 1] === "Recent questions on this machine:") lines.push("- none yet");
       return text(lines.join("\n"));
+    },
+  );
+
+  server.registerTool(
+    "leave_group",
+    {
+      title: "Leave the mindmeld group",
+      description:
+        "Disconnect this machine from the user's mindmeld group and forget the pairing, in every open session. " +
+        "Only when the user asks to leave or disconnect. Reconnecting needs a new invite.",
+      inputSchema: {
+        confirmed: z.boolean().optional().describe("Set true only if the user has explicitly confirmed in chat; otherwise a dialog asks them"),
+      },
+    },
+    async ({ confirmed }) => {
+      if (!loadConfigOrNull()) return text("You're not in a mindmeld group.");
+      if (!confirmed) {
+        if (!server.server.getClientCapabilities()?.elicitation) {
+          return text("Ask the user to confirm leaving the group, then call leave_group again with confirmed: true.", true);
+        }
+        const r = await elicit(
+          [
+            "Leave your mindmeld group?",
+            "",
+            "This disconnects every Claude session on this machine and deletes the pairing. You'll need a new invite to reconnect.",
+            "Your teammates stay connected to each other. To remove someone else, the rest of you leave and pair again with a new invite: that creates a new group key they don't have.",
+          ].join("\n"),
+          { type: "object", properties: {} },
+        );
+        if (r.action !== "accept") return text("Okay, staying in the group.");
+      }
+      disconnect();
+      deleteConfig();
+      knownSecret = null;
+      return text("Left the group. Every session on this machine is now disconnected and the pairing is deleted. Use /mindmeld:invite or /mindmeld:join to connect again.");
     },
   );
 

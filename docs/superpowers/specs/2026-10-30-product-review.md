@@ -60,7 +60,7 @@ fixed in 0.4.0; the others are tracked here.
 
 12. Groups are all-or-nothing. Everyone in a group sees every shared session. Per-pair or named
     groups would fit teams better.
-13. No way to leave a group or remove a member (needs secret rotation).
+13. ~~No way to leave a group.~~ **Fixed in 0.4.2:** `/mindmeld:leave` and `mindmeld leave`, which every open session follows within about 3 s. Removing one member still means the others leave and re-pair (a new secret). Per-member keys would fix that properly.
 14. The relay has no per-room rate limit or size cap (abuse and cost).
 15. Each auto-answer runs a fork on the answerer's own Claude quota. The rate limit (10 per
     10 min) exists but isn't visible. Show it in status.
