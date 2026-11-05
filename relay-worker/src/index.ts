@@ -41,7 +41,13 @@ export class Room extends DurableObject<Env> {
     // Hibernation API: the object can sleep between messages without dropping sockets.
     this.ctx.acceptWebSocket(server, [isPair ? "pair" : "room"]);
     if (isPair && members.length === 1) {
-      for (const ws of this.ctx.getWebSockets()) ws.send(JSON.stringify({ t: "peer-joined" }));
+      for (const ws of this.ctx.getWebSockets()) {
+        try {
+          ws.send(JSON.stringify({ t: "peer-joined" }));
+        } catch {
+          // A closing socket must not fail the join with a 500.
+        }
+      }
     }
     return new Response(null, { status: 101, webSocket: client });
   }
