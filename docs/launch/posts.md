@@ -95,3 +95,13 @@ I built it with Claude Code. I'd really like criticism of the security model.
 **Title:** Making two Claude Code sessions talk to each other
 
 Use the Show HN comment as the outline, then add the three things testing taught me: (1) a checkbox in an elicitation dialog takes keyboard focus, so Enter stops meaning Accept, (2) forks saved their own sessions and became "the most recent session" for the next question until I added `--no-session-persistence`, and (3) `--allowedTools Read` let a fork read `~/.gitconfig`, so read-only didn't mean what I assumed.
+
+## Reddit profile bio
+
+Founding engineer in Bengaluru. I build AI agents and LLM pipelines. Working on mindmeld, an open source plugin that lets Claude Code sessions ask each other questions: github.com/dhrupad-sah/mindmeld
+
+## Where to post yourself
+
+Reddit is blocked for Claude in Chrome. Hacker News, dev.to, Indie Hackers and Hashnode need your own login or signup. Medium shows a bot check. Product Hunt denied browser access.
+
+Space the Reddit posts out by a few days, and comment on other people's posts first: a new account needs karma, and r/ClaudeAI needs 50 for a feed post.
