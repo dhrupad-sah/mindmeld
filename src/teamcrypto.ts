@@ -13,6 +13,8 @@ export interface TeamFrame {
 }
 
 const SEAL_INFO = "mindmeld/seal/v1";
+const DEVICE_ID = /^[0-9a-f]{16}$/;
+const SIG_HEX = /^[0-9a-f]{128}$/;
 const frameAad = (epoch: number, dev: string) => `mindmeld/frame/v1|${epoch}|${dev}`;
 const sigMessage = (epoch: number, dev: string, d: string) => new TextEncoder().encode(`${epoch}|${dev}|${d}`);
 
@@ -66,8 +68,8 @@ export function sealFrame(epoch: number, teamKey: Uint8Array, id: DeviceIdentity
 }
 
 /**
- * Verify then decrypt a team frame. The sender is looked up in `roster` by `f.dev`; the Ed25519 signature over
- * utf8(e + "|" + dev + "|" + d) is checked against that entry's signPub BEFORE decryption; then `d` is opened with
+ * Verify then decrypt a team frame. `f.dev` must be exactly 16 lowercase hex (checked first). The sender is looked up in `roster` by `f.dev`; the Ed25519 signature over
+ * utf8(e + "|" + dev + "|" + d) is checked (strict Ed25519, zip215: false) against that entry's signPub BEFORE decryption; then `d` is opened with
  * keys.get(e) and AAD "mindmeld/frame/v1|" + e + "|" + dev. Returns the roster login and payload, or null on any
  * failure (unknown device, bad signature, unknown epoch, decrypt failure, malformed input); never throws.
  */
@@ -77,10 +79,11 @@ export function openFrame(
   roster: Map<string, { login: string; signPub: string }>,
 ): { login: string; payload: string } | null {
   try {
-    if (!f || typeof f.e !== "number" || !Number.isSafeInteger(f.e) || typeof f.dev !== "string" || typeof f.d !== "string" || typeof f.sig !== "string") return null;
+    if (!f || typeof f.dev !== "string" || !DEVICE_ID.test(f.dev)) return null;
+    if (typeof f.e !== "number" || !Number.isSafeInteger(f.e) || typeof f.d !== "string" || typeof f.sig !== "string" || !SIG_HEX.test(f.sig)) return null;
     const sender = roster.get(f.dev);
     if (!sender) return null;
-    if (!ed25519.verify(hexToBytes(f.sig), sigMessage(f.e, f.dev, f.d), hexToBytes(sender.signPub))) return null;
+    if (!ed25519.verify(hexToBytes(f.sig), sigMessage(f.e, f.dev, f.d), hexToBytes(sender.signPub), { zip215: false })) return null;
     const key = keys.get(f.e);
     if (!key) return null;
     const payload = open(key, f.d, frameAad(f.e, f.dev));

@@ -105,9 +105,7 @@ The receiver looks up `dev` in the roster, **verifies the signature first**, the
 
 ### Which signature checks are strict
 
-`zip215: false` (strict RFC 8032 style verification) is used for: the sign-in device proof (relay), wrap and commitment signatures on the relay when they are written (`relay-worker/src/team.ts`), and wrap and commitment signatures on the client (`src/teamkeys.ts`).
-
-Frame signatures in `openFrame` (`src/teamcrypto.ts`) use the library default (`ed25519.verify` without options), which is not the strict mode. Frames are also authenticated by AES-GCM under the team key, so this is a gap in consistency rather than a known attack, but a reviewer should know it.
+Every Ed25519 check uses `zip215: false` (strict RFC 8032 style verification, which also refuses small-order keys): the sign-in device proof (relay), wrap and commitment signatures on the relay when they are written (`relay-worker/src/team.ts`), wrap and commitment signatures on the client (`src/teamkeys.ts`), and frame signatures in `openFrame` (`src/teamcrypto.ts`). `openFrame` also refuses a frame whose `dev` is not exactly 16 lowercase hex characters before it looks anything up.
 
 ## Removing a member
 

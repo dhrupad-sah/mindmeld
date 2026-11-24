@@ -69,6 +69,30 @@ describe("teamcrypto", () => {
     expect(openFrame({ ...f, sig: "zz" }, keys, roster)).toBeNull();
   });
 
+  it("rejects a dev that is not exactly 16 lowercase hex, even if the roster has it", () => {
+    const teamKey = new Uint8Array(randomBytes(32));
+    const keys = new Map([[1, teamKey]]);
+    for (const dev of ["ABCDEF0123456789", "abc", "0123456789abcdef0", "zzzzzzzzzzzzzzzz", "0123456789abcde|"]) {
+      // A roster entry under the odd id, and a frame correctly signed and sealed for it.
+      const odd = { ...alice, deviceId: dev };
+      const f = sealFrame(1, teamKey, odd, "hi");
+      const r = new Map([[dev, { login: "alice", signPub: alice.signPub }]]);
+      expect(openFrame(f, keys, r), dev).toBeNull();
+    }
+    // Control: the same construction with a well-formed id opens.
+    expect(openFrame(sealFrame(1, teamKey, alice, "hi"), keys, roster)).not.toBeNull();
+  });
+
+  it("uses strict Ed25519: a small-order key with a universal signature is refused", () => {
+    const teamKey = new Uint8Array(randomBytes(32));
+    const f = sealFrame(1, teamKey, alice, "hi");
+    // A = identity point, R = identity, S = 0 verifies for every message under ZIP-215, never under RFC 8032.
+    const identity = "01" + "00".repeat(31);
+    const universal = identity + "00".repeat(32);
+    const weak = new Map([[alice.deviceId, { login: "alice", signPub: identity }]]);
+    expect(openFrame({ ...f, sig: universal }, new Map([[1, teamKey]]), weak)).toBeNull();
+  });
+
   it("rejects unknown epoch", () => {
     const teamKey = new Uint8Array(randomBytes(32));
     const f = sealFrame(1, teamKey, alice, "hi");
