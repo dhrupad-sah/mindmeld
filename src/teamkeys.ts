@@ -271,22 +271,30 @@ export async function ensureTeamKeys(opts: TeamKeyOptions): Promise<"ok" | { wai
  * to every current roster device (this one included), PUT with a signed commit at epoch + 1.
  * Returns the new epoch. If another rotation landed first (relay 400/409 and the refetched roster is
  * already at that epoch or later), an error naming the team's epoch now is thrown (`status` 409,
- * `epoch`), without retrying.
+ * `epoch`), without retrying. If a device joined between the roster read and the PUT (relay 400
+ * "rotation must cover every current device"), the rotation is redone once over a fresh roster.
  */
 export async function rotate(opts: TeamKeyOptions & { reason: "removed" }): Promise<number> {
-  const roster = await fetchRoster(opts.relayHttp, opts.teamId, opts.session);
-  if (roleOf(roster, opts.session.login) !== "admin") throw Object.assign(new Error("only admins rotate the team key"), { status: 403 });
-  const epoch = roster.epoch + 1;
-  const key = newTeamKey();
-  try {
-    await putKeys(opts, { epoch, wrapped: wrapsFor(opts, epoch, key, allDevices(roster)), commit: epochCommit(opts.id, opts.teamId, epoch, key) });
-  } catch (e) {
-    // A rotation that landed first shows up as 400 ("commit is only for a rotation", same epoch) or 409.
-    const s = statusOf(e);
-    if (s !== 400 && s !== 409) throw e;
-    const now = (await fetchRoster(opts.relayHttp, opts.teamId, opts.session)).epoch;
-    if (now < epoch) throw e;
-    throw Object.assign(new Error(`team key was rotated concurrently; the team is now at epoch ${now}`), { status: 409, epoch: now });
+  for (let attempt = 0; ; attempt++) {
+    const roster = await fetchRoster(opts.relayHttp, opts.teamId, opts.session);
+    if (roleOf(roster, opts.session.login) !== "admin") throw Object.assign(new Error("only admins rotate the team key"), { status: 403 });
+    const epoch = roster.epoch + 1;
+    const key = newTeamKey();
+    try {
+      await putKeys(opts, { epoch, wrapped: wrapsFor(opts, epoch, key, allDevices(roster)), commit: epochCommit(opts.id, opts.teamId, epoch, key) });
+      return epoch;
+    } catch (e) {
+      // A rotation that landed first shows up as 400 ("commit is only for a rotation", same epoch) or 409.
+      const s = statusOf(e);
+      if (s !== 400 && s !== 409) throw e;
+      const now = (await fetchRoster(opts.relayHttp, opts.teamId, opts.session)).epoch;
+      if (now >= epoch) throw Object.assign(new Error(`team key was rotated concurrently; the team is now at epoch ${now}`), { status: 409, epoch: now });
+      // A device joined between the roster read and the PUT: rotate once more over the new roster.
+      if (s === 400 && /cover every current device/.test((e as Error).message)) {
+        if (attempt === 0) continue;
+        throw Object.assign(new Error("team key rotation failed: the team's devices kept changing; try again"), { status: 400 });
+      }
+      throw e;
+    }
   }
-  return epoch;
 }

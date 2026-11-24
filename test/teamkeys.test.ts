@@ -247,6 +247,49 @@ describe("key distribution and rotation", () => {
     for (const k of bobKeys.keys.values()) expect(openFrame(f, new Map([[2, k]]), roster)).toBeNull();
   }, 30_000);
 
+  it("a member starting right after accepting is admitted within seconds", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const teamId = await newTeam(alice, []);
+    const a = channel(alice, teamId);
+    await waitFor(() => a.connected);
+    await call(alice, "POST", `/v1/teams/${teamId}/invites`, { login: bob.login });
+    await call(bob, "POST", `/v1/teams/${teamId}/accept`);
+    // Default no-key backoff (1s, 2s, ...), not the test's shortened one.
+    const b = new TeamChannel({ ...opts(bob, teamId), retry: { baseMs: 50, maxMs: 200 } });
+    b.on("relay-error", () => {});
+    const t0 = Date.now();
+    b.start();
+    cleanups.push(() => b.stop());
+    await waitFor(() => b.connected, 5000);
+    expect(Date.now() - t0).toBeLessThan(5000);
+  }, 30_000);
+
+  it("rotation redoes itself once when a device joins between the roster read and the PUT", async () => {
+    const alice = await user("alice");
+    const carol = await user("carol");
+    const teamId = await newTeam(alice, [carol]);
+    expect(await ensureTeamKeys(opts(alice, teamId))).toBe("ok");
+    const carol2 = await signInTestUser(relay, carol.login); // a second device for carol
+    const real = globalThis.fetch;
+    let injected = false;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (!injected && init?.method === "PUT") {
+        injected = true;
+        await real(`${relay.url}/v1/teams/${teamId}/devices`, { method: "POST", headers: { authorization: `Bearer ${carol2.token}` } });
+      }
+      return real(input, init);
+    }) as typeof fetch;
+    cleanups.push(() => (globalThis.fetch = real));
+    expect(await rotate({ ...opts(alice, teamId), reason: "removed" })).toBe(2);
+    globalThis.fetch = real;
+    expect(injected).toBe(true);
+    const ak = await keysOf(alice, teamId);
+    const c2 = await keysOf(carol2, teamId);
+    expect(c2.problems).toEqual([]);
+    expect(c2.keys.get(2)).toEqual(ak.keys.get(2));
+  }, 30_000);
+
   it("a concurrent rotation is reported, not retried", async () => {
     const alice = await user("alice");
     const teamId = await newTeam(alice, []);

@@ -16,7 +16,10 @@ export interface TeamChannelOptions {
   id: DeviceIdentity;
   /** Reconnect backoff (tests shrink it). Default: 2s doubling to 60s. */
   retry?: { baseMs: number; maxMs: number };
-  /** Wait before retrying while this device has no team key (tests shrink it). Default 30s. */
+  /**
+   * First retry delay while this device has no team key; doubles per attempt up to 30s, reset once
+   * admitted (tests shrink it). Default 1s.
+   */
   noKeyRetryMs?: number;
 }
 
@@ -49,8 +52,12 @@ const TeamMessage = z.discriminatedUnion("t", [
 const RETRY_BASE_MS = 2000;
 const RETRY_MAX_MS = 60_000;
 const CLOSE_TIMEOUT_MS = 1000;
-/** A device without a key waits for one to be wrapped for it; no need to knock every 2s. */
-const NO_KEY_RETRY_MS = 30_000;
+/**
+ * A device without a key waits for a teammate to wrap one for it. On a normal onboarding the
+ * teammate is online and delivers within moments, so start short and back off to 30s.
+ */
+const NO_KEY_RETRY_BASE_MS = 1000;
+const NO_KEY_RETRY_MAX_MS = 30_000;
 /** Frames for an epoch this client has no key for yet, held until the next key refresh. */
 const MAX_HELD = 64;
 /** Key-distribution passes per refresh (each write is followed by a refetch). */
@@ -87,6 +94,8 @@ export class TeamChannel extends EventEmitter implements Channel {
   private retryTimer: NodeJS.Timeout | null = null;
   /** Consecutive failed connection attempts; reset once the relay admits this device. */
   private failures = 0;
+  /** Consecutive "no team key yet" closes; reset once the relay admits this device. */
+  private noKeyAttempts = 0;
   /** Set when the relay answered 401 to the WebSocket upgrade. */
   private authRefused = false;
   /** `terminal` ran: its "closed" event was the last one. */
@@ -102,6 +111,7 @@ export class TeamChannel extends EventEmitter implements Channel {
     this.stopped = false;
     this.finished = false;
     this.failures = 0;
+    this.noKeyAttempts = 0;
     void this.connect();
   }
 
@@ -113,11 +123,11 @@ export class TeamChannel extends EventEmitter implements Channel {
     this.ws?.close();
   }
 
-  /** Try again after the backoff delay (at least `minMs`). Emits "retry" (delayMs). */
-  private scheduleRetry(minMs = 0): void {
+  /** Try again after `delayMs`, or else the connection-failure backoff. Emits "retry" (delayMs). */
+  private scheduleRetry(delayMs?: number): void {
     if (this.stopped) return;
     const { baseMs, maxMs } = this.opts.retry ?? { baseMs: RETRY_BASE_MS, maxMs: RETRY_MAX_MS };
-    const delay = Math.max(minMs, backoffDelay(this.failures++, baseMs, maxMs));
+    const delay = delayMs ?? backoffDelay(this.failures++, baseMs, maxMs);
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
@@ -291,7 +301,7 @@ export class TeamChannel extends EventEmitter implements Channel {
       this.emit("closed", code, reason);
       if (code === TEAM_CLOSE.noKey) {
         this.setReason(this.waiting ? WAITING_FOR_KEY : "no team key yet");
-        return this.scheduleRetry(this.opts.noKeyRetryMs ?? NO_KEY_RETRY_MS);
+        return this.scheduleRetry(backoffDelay(this.noKeyAttempts++, this.opts.noKeyRetryMs ?? NO_KEY_RETRY_BASE_MS, NO_KEY_RETRY_MAX_MS));
       }
       this.scheduleRetry();
     });
@@ -315,6 +325,7 @@ export class TeamChannel extends EventEmitter implements Channel {
         if (!this.admitted) {
           this.admitted = true;
           this.failures = 0;
+          this.noKeyAttempts = 0;
           this.setReason(null);
           this.emit("connected");
         }
