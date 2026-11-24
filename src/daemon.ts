@@ -178,7 +178,7 @@ export class Daemon extends EventEmitter {
     return this.opts.name;
   }
 
-    get sharing(): { label: string } | null {
+  get sharing(): { label: string } | null {
     return this.share;
   }
 
