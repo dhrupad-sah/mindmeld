@@ -10,7 +10,7 @@
   // Clients below MIN_VERSION are refused with an update message; below LATEST they see "update available".
   // Pre-0.5 clients don't report a version and are kept in their own pool.
   "vars": {
-    "LATEST_VERSION": "0.5.0",
+    "LATEST_VERSION": "0.6.0",
     "MIN_VERSION": "0.5.0",
     // Where the relay checks GitHub sign-ins (tests point this at a mock).
     "GITHUB_API_BASE": "https://api.github.com"
