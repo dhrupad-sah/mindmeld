@@ -1,0 +1,252 @@
+import WebSocket from "ws";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { Daemon } from "../src/daemon.js";
+import type { Payload } from "../src/protocol.js";
+import { openFrame, sealFrame, type TeamFrame } from "../src/teamcrypto.js";
+import { TeamChannel } from "../src/teamchannel.js";
+import { fetchRoster, fetchTeamKeys } from "../src/teamkeys.js";
+import { signInTestUser, type TestUser } from "./helpers/signin.js";
+import { keysBody, newTeamKey } from "./helpers/teamkeys.js";
+import { startTestRelay, type TestRelay } from "./helpers/worker.js";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(cond: () => boolean, ms = 5000) {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("timed out");
+    await sleep(20);
+  }
+}
+
+describe("team channel", () => {
+  let relay: TestRelay;
+  beforeAll(async () => {
+    relay = await startTestRelay();
+  }, 60_000);
+  afterAll(async () => {
+    await relay?.stop();
+  }, 30_000);
+
+  const cleanups: (() => unknown)[] = [];
+  afterEach(async () => {
+    for (const c of cleanups.splice(0)) await c();
+  });
+
+  let n = 0;
+  const user = (base: string) => signInTestUser(relay, `${base}${++n}`);
+  const session = (u: TestUser) => ({ login: u.login, token: u.token, expiresAt: Date.now() / 1000 + 3600 });
+  const call = async (u: TestUser, method: string, path: string, body?: unknown) => {
+    const res = await fetch(`${relay.url}${path}`, {
+      method,
+      headers: { authorization: `Bearer ${u.token}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    expect(res.status, `${method} ${path}`).toBe(200);
+    return res.json() as Promise<any>;
+  };
+  /** A team with `admin` and `members`; epoch 1 key wrapped for everyone in `keyed`. */
+  async function team(admin: TestUser, members: TestUser[], keyed: TestUser[]) {
+    const { teamId } = await call(admin, "POST", "/v1/teams", { name: "core" });
+    for (const m of members) {
+      await call(admin, "POST", `/v1/teams/${teamId}/invites`, { login: m.login });
+      await call(m, "POST", `/v1/teams/${teamId}/accept`);
+    }
+    const key = newTeamKey();
+    await call(admin, "PUT", `/v1/teams/${teamId}/keys`, keysBody(admin.id, teamId, 1, key, keyed.map((u) => u.id)));
+    return { teamId: teamId as string, key };
+  }
+  function channel(u: TestUser, teamId: string) {
+    const ch = new TeamChannel({ relayHttp: relay.url, teamId, session: session(u), id: u.id });
+    const got: { p: Payload; login?: string; cid?: string }[] = [];
+    const closes: { code: number; reason: string }[] = [];
+    ch.on("payload", (p: Payload, from: { login?: string; cid?: string }) => got.push({ p, ...from }));
+    ch.on("closed", (code: number, reason: string) => closes.push({ code, reason }));
+    ch.start();
+    cleanups.push(() => ch.stop());
+    return { ch, got, closes };
+  }
+  /** A raw team socket for `u`, recording every message and its close. */
+  function raw(u: TestUser, teamId: string) {
+    const ws = new WebSocket(`${relay.wsUrl}/v1/teams/${teamId}/ws`, { headers: { authorization: `Bearer ${u.token}` } });
+    const msgs: any[] = [];
+    let closed: { code: number; reason: string } | null = null;
+    ws.on("message", (d) => msgs.push(JSON.parse(d.toString())));
+    ws.on("close", (code, reason) => (closed = { code, reason: reason.toString() }));
+    ws.on("error", () => {});
+    cleanups.push(() => ws.close());
+    return { ws, msgs, closed: () => closed };
+  }
+  const hello = (name: string): Payload => ({ type: "hello", peer: `peer-${name}`, name, project: "p", v: 3 });
+
+  it("members exchange payloads with verified login", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const { teamId } = await team(alice, [bob], [alice, bob]);
+    const a = channel(alice, teamId);
+    const b = channel(bob, teamId);
+    await waitFor(() => a.ch.connected && b.ch.connected);
+    expect(a.ch.server).toMatchObject({ t: "server", latest: expect.any(String), minimum: expect.any(String) });
+    // The payload claims a name; the receiver only trusts the signature.
+    a.ch.send(hello("mallory"));
+    await waitFor(() => b.got.length === 1);
+    expect(b.got[0]).toMatchObject({ p: { type: "hello", name: "mallory" }, login: alice.login, cid: expect.any(String) });
+    b.ch.send(hello("bob"));
+    await waitFor(() => a.got.length === 1);
+    expect(a.got[0].login).toBe(bob.login);
+    expect(a.ch.framesSent).toBe(1);
+    expect(b.ch.framesSent).toBe(1);
+    expect(a.got.length).toBe(1); // no echo to the sender
+  }, 30_000);
+
+  it("forged frame is dropped", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const carol = await user("carol"); // not in the team: her device key is unknown to the roster
+    const { teamId, key } = await team(alice, [bob], [alice, bob]);
+    const a = channel(alice, teamId);
+    await waitFor(() => a.ch.connected);
+    const r = raw(bob, teamId);
+    await waitFor(() => r.msgs.some((m) => m.t === "server"));
+    const send = (f: TeamFrame) => r.ws.send(JSON.stringify({ t: "msg", f }));
+    // Signed by another device under bob's device id: bad signature.
+    const forged = sealFrame(1, key, { ...carol.id, deviceId: bob.id.deviceId }, JSON.stringify(hello("forged")));
+    send(forged);
+    // Claims alice's device: the relay drops it (and alice's signature check would too).
+    send(sealFrame(1, key, { ...bob.id, deviceId: alice.id.deviceId }, JSON.stringify(hello("as-alice"))));
+    // Encrypted under a key nobody was given.
+    send(sealFrame(1, newTeamKey(), bob.id, JSON.stringify(hello("wrong-key"))));
+    send(sealFrame(1, key, bob.id, JSON.stringify(hello("genuine"))));
+    await waitFor(() => a.got.length >= 1);
+    await sleep(200);
+    expect(a.got.map((g) => [g.p.type === "hello" && g.p.name, g.login])).toEqual([["genuine", bob.login]]);
+  }, 30_000);
+
+  it("drops a frame whose verified login differs from the relay's stamp or the connection's first sender", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const { teamId, key } = await team(alice, [bob], [alice, bob]);
+    const a = channel(alice, teamId);
+    await waitFor(() => a.ch.connected && a.ch.status === null);
+    const inject = (f: TeamFrame, c: string, login: string) =>
+      (a.ch as unknown as { handleMessage(raw: string): void }).handleMessage(JSON.stringify({ t: "msg", f, c, login }));
+    const fromBob = (name: string) => sealFrame(1, key, bob.id, JSON.stringify(hello(name)));
+    inject(fromBob("stamp-mismatch"), "c1", alice.login); // relay says alice, signature says bob
+    inject(fromBob("first"), "c2", bob.login); // binds c2 to bob
+    inject(sealFrame(1, key, alice.id, JSON.stringify(hello("rebind"))), "c2", alice.login); // c2 already bob's
+    inject(fromBob("again"), "c2", bob.login);
+    await sleep(50);
+    expect(a.got.map((g) => g.p.type === "hello" && g.p.name)).toEqual(["first", "again"]);
+  }, 30_000);
+
+  it("removed member cannot read frames after rotation", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const carol = await user("carol");
+    const { teamId } = await team(alice, [bob, carol], [alice, bob, carol]);
+    const a = channel(alice, teamId);
+    const b = channel(bob, teamId);
+    await waitFor(() => a.ch.connected && b.ch.connected);
+    const bobKeys = await fetchTeamKeys(relay.url, teamId, session(bob), bob.id, await fetchRoster(relay.url, teamId, session(bob)));
+    expect([...bobKeys.keys.keys()]).toEqual([1]);
+
+    await call(alice, "DELETE", `/v1/teams/${teamId}/members/${bob.login}`);
+    await waitFor(() => b.closes.length > 0);
+    expect(b.closes[0]).toEqual({ code: 4001, reason: "removed from team" });
+    expect(b.ch.connected).toBe(false);
+    expect(b.ch.status).toMatch(/removed/);
+
+    await call(alice, "PUT", `/v1/teams/${teamId}/keys`, keysBody(alice.id, teamId, 2, newTeamKey(), [alice.id, carol.id]));
+    await waitFor(() => a.ch.epoch === 2);
+    const c = raw(carol, teamId);
+    await waitFor(() => c.msgs.some((m) => m.t === "server"));
+    a.ch.send(hello("after-rotation"));
+    await waitFor(() => c.msgs.some((m) => m.t === "msg"));
+    const f = c.msgs.find((m) => m.t === "msg").f as TeamFrame;
+    expect(f.e).toBe(2);
+    const roster = new Map([[alice.id.deviceId, { login: alice.login, signPub: alice.id.signPub }]]);
+    for (const k of bobKeys.keys.values()) expect(openFrame(f, new Map([[f.e, k]]), roster)).toBeNull();
+    // Bob's channel does not come back.
+    await sleep(2500);
+    expect(b.closes.length).toBe(1);
+  }, 30_000);
+
+  it("device without key gets 4003 and a clear reason", async () => {
+    const alice = await user("alice");
+    const dave = await user("dave");
+    const { teamId } = await team(alice, [], [alice]);
+    await call(alice, "POST", `/v1/teams/${teamId}/invites`, { login: dave.login });
+    await call(dave, "POST", `/v1/teams/${teamId}/accept`);
+    const r = raw(dave, teamId);
+    await waitFor(() => r.closed() !== null);
+    expect(r.closed()).toEqual({ code: 4003, reason: "no team key yet" });
+    expect(r.msgs).toEqual([]);
+    const d = channel(dave, teamId);
+    await waitFor(() => d.closes.length > 0);
+    expect(d.closes[0]).toEqual({ code: 4003, reason: "no team key yet" });
+    expect(d.ch.connected).toBe(false);
+    expect(d.ch.status).toBe("no team key yet");
+  }, 30_000);
+
+  it("non-members are refused and sockets need a token", async () => {
+    const alice = await user("alice");
+    const eve = await user("eve");
+    const { teamId } = await team(alice, [], [alice]);
+    const r = raw(eve, teamId);
+    await waitFor(() => r.closed() !== null);
+    expect(r.closed()!.code).toBe(4001);
+    const status = await new Promise<number>((resolve) => {
+      const ws = new WebSocket(`${relay.wsUrl}/v1/teams/${teamId}/ws`);
+      ws.on("unexpected-response", (_req, res) => resolve(res.statusCode ?? 0));
+      ws.on("error", () => {});
+    });
+    expect(status).toBe(401);
+  }, 30_000);
+
+  it("roster changes reach every socket and joined/left carry the login", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const { teamId } = await team(alice, [bob], [alice, bob]);
+    const r = raw(alice, teamId);
+    await waitFor(() => r.msgs.some((m) => m.t === "server"));
+    expect(r.msgs[0]).toEqual({ t: "server", latest: expect.any(String), minimum: expect.any(String), epoch: 1 });
+    const b = raw(bob, teamId);
+    await waitFor(() => r.msgs.some((m) => m.t === "joined"));
+    const joined = r.msgs.find((m) => m.t === "joined");
+    expect(joined).toEqual({ t: "joined", c: expect.any(String), login: bob.login });
+    await call(alice, "POST", `/v1/teams/${teamId}/roles`, { login: bob.login, role: "admin" });
+    await waitFor(() => r.msgs.some((m) => m.t === "roster") && b.msgs.some((m) => m.t === "roster"));
+    b.ws.close();
+    await waitFor(() => r.msgs.some((m) => m.t === "left"));
+    expect(r.msgs.find((m) => m.t === "left")).toEqual({ t: "left", c: joined.c, login: bob.login });
+  }, 30_000);
+
+  it("daemons ask and answer over team channels, named by login", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const { teamId } = await team(alice, [bob], [alice, bob]);
+    const asked: string[] = [];
+    const daemon = (u: TestUser, claimed: string) => {
+      const d = new Daemon({
+        secret: "unused",
+        relay: "ws://unused",
+        channel: new TeamChannel({ relayHttp: relay.url, teamId, session: session(u), id: u.id }),
+        name: claimed,
+        project: "proj",
+        decide: async (ask) => {
+          asked.push(ask.from);
+          return { action: "send", text: `hi from ${u.login}` };
+        },
+      });
+      d.start();
+      cleanups.push(() => d.stop());
+      return d;
+    };
+    const a = daemon(alice, "mallory");
+    const b = daemon(bob, "someone-else");
+    await waitFor(() => a.onlinePeers().length === 1 && b.onlinePeers().length === 1);
+    expect(a.onlinePeers()[0].name).toBe(bob.login);
+    expect(await a.ask("hello?", { peer: bob.login, timeoutSec: 5 })).toEqual({ from: bob.login, text: `hi from ${bob.login}` });
+    expect(asked).toEqual([alice.login]);
+    expect(a.framesSent).toBeGreaterThan(0);
+  }, 30_000);
+});

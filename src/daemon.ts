@@ -71,6 +71,11 @@ export class Daemon extends EventEmitter {
   private readonly pending = new Map<string, PendingAsk>();
   private readonly inbox: Snippet[] = [];
   private readonly askLog = new Map<string, number[]>();
+  /**
+   * Verified login that first used each peer id (only for channels that report logins). A hello,
+   * bye or reply for that peer id from any other login is ignored. Never cleared: peer ids are random.
+   */
+  private readonly peerOwner = new Map<string, string>();
   private share: { label: string } | null;
 
   constructor(private readonly opts: DaemonOptions) {
@@ -216,9 +221,25 @@ export class Daemon extends EventEmitter {
     }
   }
 
+  /** False if `login` is set and the peer id was first seen from a different login; binds it otherwise. */
+  private ownsPeer(peerId: string, login: string | undefined): boolean {
+    if (login === undefined) return true;
+    const owner = this.peerOwner.get(peerId);
+    if (owner === undefined) this.peerOwner.set(peerId, login);
+    return owner === undefined || owner === login;
+  }
+
+  /** False if a reply to a question came from a login other than the one that owns the asked peer. */
+  private fromTarget(pending: PendingAsk, login: string | undefined): boolean {
+    if (login === undefined) return true;
+    const owner = this.peerOwner.get(pending.target);
+    return owner === undefined || owner === login;
+  }
+
   private handlePayload(p: Payload, from: PayloadSender): void {
     // An authenticated login beats any name the payload claims for itself.
     const login = from.login;
+    if ((p.type === "hello" || p.type === "bye") && !this.ownsPeer(p.peer, login)) return;
     switch (p.type) {
       case "hello": {
         const isNew = !this.peers.has(p.peer);
@@ -244,7 +265,7 @@ export class Daemon extends EventEmitter {
         break;
       case "status": {
         const pending = this.pending.get(p.id);
-        if (pending) {
+        if (pending && this.fromTarget(pending, login)) {
           pending.acked = true;
           pending.onStatus?.(p.state);
         }
@@ -252,7 +273,7 @@ export class Daemon extends EventEmitter {
       }
       case "answer": {
         const pending = this.pending.get(p.id);
-        if (pending) {
+        if (pending && this.fromTarget(pending, login)) {
           this.pending.delete(p.id);
           pending.resolve({ from: this.nameOf(p.from, undefined, login), text: p.text });
         }
@@ -260,7 +281,7 @@ export class Daemon extends EventEmitter {
       }
       case "decline": {
         const pending = this.pending.get(p.id);
-        if (!pending) break;
+        if (!pending || !this.fromTarget(pending, login)) break;
         pending.declines.push(`${this.nameOf(p.from, undefined, login)}: ${p.reason}`);
         if (pending.declines.length >= pending.expected) {
           this.pending.delete(p.id);
@@ -302,7 +323,8 @@ export class Daemon extends EventEmitter {
 
     const report = (state: AskState) => this.send({ type: "status", id: ask.id, from: this.peerId, state });
     report("received");
-    if (this.rateLimited(ask.from)) {
+    // A verified login cannot dodge the limit by rotating peer ids.
+    if (this.rateLimited(login ?? ask.from)) {
       reply({ action: "decline", reason: "rate limited — too many questions, try again later" });
       return;
     }

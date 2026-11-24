@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { verifyToken, type AuthEnv, type DeviceRecord, type TeamIndexEntry, type TeamIndexRole } from "./auth.js";
+import { CLOSE_NO_KEY, CLOSE_NO_TEAM, CLOSE_REMOVED, socketCaller, TeamSockets, upgradeRequest, type Admission } from "./teamsocket.js";
 
 /**
  * Teams on the relay: roster, invites, roles, device records, wrapped team keys per epoch and an
@@ -22,6 +23,7 @@ import { verifyToken, type AuthEnv, type DeviceRecord, type TeamIndexEntry, type
  *   Wrap = { sealed, by, sig, commit: { hash, by, sig } | null } and `by` is the writer's deviceId.
  * - DELETE /v1/teams/:id/members/:login (admin) -> { needsRotation: true }.
  * - POST /v1/teams/:id/roles { login, role } (admin).
+ * - GET /v1/teams/:id/ws (WebSocket upgrade): the team socket, see src/teamsocket.ts.
  * Errors: 404 for an unknown team (or malformed teamId), 403 for a non-member or a role that is not
  * enough, on every route. TeamIds are 64 random bits, so 403 only confirms an id the caller already has.
  * Logins are lowercased everywhere. The caller's device keys come from its Users record, never the body.
@@ -32,6 +34,8 @@ import { verifyToken, type AuthEnv, type DeviceRecord, type TeamIndexEntry, type
 
 export interface TeamEnv extends AuthEnv {
   TEAMS: DurableObjectNamespace<Team>;
+  LATEST_VERSION: string;
+  MIN_VERSION: string;
 }
 
 type Role = "admin" | "member";
@@ -141,7 +145,7 @@ async function authenticate(req: Request, env: TeamEnv): Promise<Caller | null> 
   return device ? { login, device } : null;
 }
 
-const TEAM_PATH = /^\/v1\/teams\/([0-9a-f]{16})(?:\/(invites|accept|devices|keys|roles|members\/([^/]+)))?$/;
+const TEAM_PATH = /^\/v1\/teams\/([0-9a-f]{16})(?:\/(invites|accept|devices|keys|roles|ws|members\/([^/]+)))?$/;
 
 /** Handle /v1/teams and /v1/teams/*; null for any other path. */
 export async function handleTeams(req: Request, env: TeamEnv, pathname: string): Promise<Response | null> {
@@ -207,6 +211,9 @@ export async function handleTeams(req: Request, env: TeamEnv, pathname: string):
       case "GET keys":
         r = await team.getKeys(caller);
         break;
+      case "GET ws":
+        if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") return json(426, { error: "expected a websocket" });
+        return team.fetch(upgradeRequest(caller.login, caller.device.deviceId));
       case "DELETE members": {
         let raw: string;
         try {
@@ -241,8 +248,11 @@ export async function handleTeams(req: Request, env: TeamEnv, pathname: string):
 
 /** One team: its roster, devices, wrapped keys and membership log, in Durable Object SQLite. */
 export class Team extends DurableObject<TeamEnv> {
+  private readonly sockets: TeamSockets;
+
   constructor(ctx: DurableObjectState, env: TeamEnv) {
     super(ctx, env);
+    this.sockets = new TeamSockets(ctx, () => ({ latest: env.LATEST_VERSION, minimum: env.MIN_VERSION }));
     const sql = ctx.storage.sql;
     sql.exec("CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK (id = 1), name TEXT NOT NULL, epoch INTEGER NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS members (login TEXT PRIMARY KEY, role TEXT NOT NULL)");
@@ -296,6 +306,33 @@ export class Team extends DurableObject<TeamEnv> {
     return { ...meta, role };
   }
 
+  private hasKey(deviceId: string, epoch: number): boolean {
+    return this.sql.exec("SELECT 1 FROM keys WHERE deviceId = ? AND epoch = ?", deviceId, epoch).toArray().length > 0;
+  }
+
+  /** Tell team sockets the roster changed; sockets of devices without the current key are closed. */
+  private changed(): void {
+    const epoch = this.meta()?.epoch ?? 0;
+    this.sockets.rosterChanged((id) => this.hasKey(id, epoch));
+  }
+
+  /** Team socket upgrade, reached only from handleTeams with the verified caller in internal headers. */
+  async fetch(req: Request): Promise<Response> {
+    const { login, deviceId } = socketCaller(req);
+    const meta = this.meta();
+    const owner = this.deviceOwner(deviceId);
+    let admit: Admission;
+    if (!meta) admit = { ok: false, code: CLOSE_NO_TEAM, reason: "no such team" };
+    else if (!this.roleOf(login) || (owner && owner !== login)) admit = { ok: false, code: CLOSE_REMOVED, reason: "not a member of this team" };
+    else if (!owner || !this.hasKey(deviceId, meta.epoch)) admit = { ok: false, code: CLOSE_NO_KEY, reason: "no team key yet" };
+    else admit = { ok: true, epoch: meta.epoch };
+    return this.sockets.accept(login, deviceId, admit);
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> { this.sockets.message(ws, message); }
+  async webSocketClose(ws: WebSocket): Promise<void> { this.sockets.closed(ws); }
+  async webSocketError(ws: WebSocket): Promise<void> { this.sockets.closed(ws); }
+
   /** Set up a new team with `caller` as its admin. 409 if this teamId is already taken. */
   create(name: string, caller: Caller): TeamResult {
     if (this.meta()) return fail(409, "team id taken");
@@ -338,6 +375,7 @@ export class Team extends DurableObject<TeamEnv> {
       this.sql.exec("INSERT INTO invites (login) VALUES (?)", login);
       this.log(caller.login, "invited", login);
     });
+    this.changed();
     return { ...ok(), name: g.name, index: [{ login, role: "invited" }] };
   }
 
@@ -355,6 +393,7 @@ export class Team extends DurableObject<TeamEnv> {
       if (!owner) this.insertDevice(caller.login, caller.device);
       this.log(caller.login, "joined", caller.login);
     });
+    this.changed();
     return { ...ok(), name: meta.name, index: [{ login: caller.login, role: "member" }] };
   }
 
@@ -369,6 +408,7 @@ export class Team extends DurableObject<TeamEnv> {
       this.insertDevice(caller.login, caller.device);
       this.log(caller.login, "device-added", caller.device.deviceId);
     });
+    this.changed();
     return ok({ added: true });
   }
 
@@ -402,6 +442,7 @@ export class Team extends DurableObject<TeamEnv> {
         this.sql.exec("DELETE FROM commits WHERE epoch < ?", epoch - PREVIOUS_EPOCHS);
         this.log(caller.login, "rotated", String(epoch));
       });
+      this.changed();
       return ok({ epoch });
     }
     const fresh: string[] = [];
@@ -413,6 +454,7 @@ export class Team extends DurableObject<TeamEnv> {
     this.ctx.storage.transactionSync(() => {
       for (const id of fresh) insert(id);
     });
+    if (fresh.length) this.changed();
     return ok({ epoch, added: fresh.length });
   }
 
@@ -454,6 +496,7 @@ export class Team extends DurableObject<TeamEnv> {
       this.log(caller.login, "removed", login);
     });
     this.closeMemberSockets(login, deviceIds);
+    this.changed();
     return { ...ok({ needsRotation: true }), name: g.name, index: [{ login, role: null }] };
   }
 
@@ -469,12 +512,12 @@ export class Team extends DurableObject<TeamEnv> {
       this.sql.exec("UPDATE members SET role = ? WHERE login = ?", role, login);
       this.log(caller.login, "role", login);
     });
+    this.changed();
     return { ...ok(), name: g.name, index: [{ login, role }] };
   }
 
-  /**
-   * Close the team sockets of a removed member's devices. Hook for Task 7 (team sockets); a no-op
-   * until sockets live here.
-   */
-  closeMemberSockets(_login: string, _deviceIds: string[]): void {}
+  /** Close the team sockets of a removed member's devices (4001 "removed from team"). */
+  closeMemberSockets(_login: string, deviceIds: string[]): void {
+    this.sockets.closeDevices(deviceIds, CLOSE_REMOVED, "removed from team");
+  }
 }
