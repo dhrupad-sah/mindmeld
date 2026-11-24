@@ -1,9 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519.js";
-import { hexToBytes } from "@noble/hashes/utils.js";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import type { Session } from "./auth/session.js";
 import type { DeviceIdentity } from "./identity.js";
-import { openFromDevice } from "./teamcrypto.js";
+import { openFromDevice, sealToDevice } from "./teamcrypto.js";
 
 /** One device in a team roster, as GET /v1/teams/:id returns it. */
 export interface RosterDevice {
@@ -143,4 +143,150 @@ export async function fetchRoster(relayHttp: string, teamId: string, session: Se
 export async function fetchTeamKeys(relayHttp: string, teamId: string, session: Session, id: DeviceIdentity, roster: TeamRoster): Promise<VerifiedKeys> {
   const body = (await getJson(`${httpBase(relayHttp)}/v1/teams/${teamId}/keys`, session)) as { epoch: number; epochs: Record<string, WrapEntry> };
   return verifyTeamKeys(teamId, id, roster, body);
+}
+
+/** Status text for a device that is in the team but has not been given the current team key yet. */
+export const WAITING_FOR_KEY = "waiting for a teammate to come online to give this device the team key";
+
+/** Where and as whom to talk to the relay about one team's keys. */
+export interface TeamKeyOptions {
+  /** Relay base URL (http(s):// or ws(s)://). */
+  relayHttp: string;
+  teamId: string;
+  session: Session;
+  id: DeviceIdentity;
+}
+
+/** A device a wrap is addressed to. */
+export interface Recipient {
+  deviceId: string;
+  boxPub: string;
+}
+
+/** A fresh random 32-byte team key. */
+export const newTeamKey = (): Uint8Array => new Uint8Array(randomBytes(32));
+
+const signUtf8 = (signer: DeviceIdentity, msg: string) => bytesToHex(ed25519.sign(new TextEncoder().encode(msg), hexToBytes(signer.signPriv)));
+
+/** Ed25519 signature `signer` puts on a wrap: utf8("mm-wrap|v1|" + teamId + "|" + epoch + "|" + recipient + "|" + sealed). */
+export const wrapSig = (signer: DeviceIdentity, teamId: string, epoch: number, recipientId: string, sealed: string): string =>
+  signUtf8(signer, `mm-wrap|v1|${teamId}|${epoch}|${recipientId}|${sealed}`);
+
+/** Seal `teamKey` to `to` and sign the wrap as `signer`. */
+export function signedWrap(signer: DeviceIdentity, teamId: string, epoch: number, to: Recipient, teamKey: Uint8Array): { sealed: string; sig: string } {
+  const sealed = sealToDevice(to.boxPub, teamKey);
+  return { sealed, sig: wrapSig(signer, teamId, epoch, to.deviceId, sealed) };
+}
+
+/** An epoch commitment: hash = hex sha256(teamKey), sig by `signer` over utf8("mm-epoch|v1|" + teamId + "|" + epoch + "|" + hash). */
+export function epochCommit(signer: DeviceIdentity, teamId: string, epoch: number, teamKey: Uint8Array): { hash: string; sig: string } {
+  const hash = createHash("sha256").update(teamKey).digest("hex");
+  return { hash, sig: signUtf8(signer, `mm-epoch|v1|${teamId}|${epoch}|${hash}`) };
+}
+
+/** PUT /v1/teams/:id/keys. Throws on an HTTP error (`status` on the error). */
+async function putKeys(o: TeamKeyOptions, body: { epoch: number; wrapped: Record<string, { sealed: string; sig: string }>; commit?: { hash: string; sig: string } }): Promise<void> {
+  const res = await fetch(`${httpBase(o.relayHttp)}/v1/teams/${o.teamId}/keys`, {
+    method: "PUT",
+    headers: { authorization: `Bearer ${o.session.token}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let json: unknown = null;
+  try {
+    json = await res.json();
+  } catch {}
+  if (!res.ok) {
+    const msg = json && typeof (json as { error?: unknown }).error === "string" ? (json as { error: string }).error : `HTTP ${res.status}`;
+    throw Object.assign(new Error(`relay: ${msg}`), { status: res.status });
+  }
+}
+
+const statusOf = (e: unknown) => (e as { status?: number })?.status;
+const roleOf = (roster: TeamRoster, login: string) => roster.members.find((m) => m.login === login.toLowerCase())?.role;
+const allDevices = (roster: TeamRoster) => roster.members.flatMap((m) => m.devices);
+
+/** Seal `key` to each of `to`, signed by this device, as a PUT /keys `wrapped` map. */
+const wrapsFor = (o: TeamKeyOptions, epoch: number, key: Uint8Array, to: Recipient[]) =>
+  Object.fromEntries(to.map((d) => [d.deviceId, signedWrap(o.id, o.teamId, epoch, d, key)]));
+
+/**
+ * One key-distribution pass over an already fetched `roster` and this device's `verified` keys:
+ * - epoch 0 (no key yet) and the caller is an admin: create the first key (epoch 1, with commit) for every device;
+ * - this device holds the verified current key: seal it to every roster device with `hasKey: false`
+ *   (a 409 means another member got there first, which is fine);
+ * - otherwise this device is waiting for a teammate to deliver its key.
+ * `wrote` is true when something was PUT (the caller should refetch). Throws on relay errors other
+ * than a delivery 409, including a 400/409 when creating epoch 1 races another device.
+ * Never logs key material.
+ */
+export async function distributeKeys(
+  o: TeamKeyOptions,
+  roster: TeamRoster,
+  verified: VerifiedKeys,
+): Promise<{ result: "ok" | { waiting: string }; wrote: boolean }> {
+  const waiting = { waiting: WAITING_FOR_KEY };
+  if (roster.epoch === 0 && verified.epoch === 0) {
+    if (roleOf(roster, o.session.login) !== "admin") return { result: waiting, wrote: false };
+    const key = newTeamKey();
+    await putKeys(o, { epoch: 1, wrapped: wrapsFor(o, 1, key, allDevices(roster)), commit: epochCommit(o.id, o.teamId, 1, key) });
+    return { result: "ok", wrote: true };
+  }
+  // Keys fetched across a rotation: nothing to deliver from this snapshot; refetch.
+  if (verified.epoch !== roster.epoch) return { result: verified.keys.has(verified.epoch) ? "ok" : waiting, wrote: true };
+  const key = verified.keys.get(roster.epoch);
+  if (!key) return { result: waiting, wrote: false };
+  const pending = allDevices(roster).filter((d) => d.hasKey === false && d.deviceId !== o.id.deviceId);
+  if (pending.length === 0) return { result: "ok", wrote: false };
+  try {
+    await putKeys(o, { epoch: roster.epoch, wrapped: wrapsFor(o, roster.epoch, key, pending) });
+  } catch (e) {
+    // Another member already delivered (or the team rotated meanwhile): the device is covered.
+    if (statusOf(e) !== 409) throw e;
+  }
+  return { result: "ok", wrote: true };
+}
+
+/**
+ * Make sure the team's current key exists and has reached every device this device can help:
+ * creates epoch 1 when the team has no key and the caller is an admin, and seals the current key to
+ * roster devices that lack it. Returns `{ waiting }` (WAITING_FOR_KEY) when this device has no
+ * usable current key. A 400/409 from a race with another device is retried once after a refetch.
+ */
+export async function ensureTeamKeys(opts: TeamKeyOptions): Promise<"ok" | { waiting: string }> {
+  for (let attempt = 0; ; attempt++) {
+    const roster = await fetchRoster(opts.relayHttp, opts.teamId, opts.session);
+    const verified = await fetchTeamKeys(opts.relayHttp, opts.teamId, opts.session, opts.id, roster);
+    try {
+      return (await distributeKeys(opts, roster, verified)).result;
+    } catch (e) {
+      const s = statusOf(e);
+      if (attempt === 0 && (s === 400 || s === 409)) continue;
+      throw e;
+    }
+  }
+}
+
+/**
+ * Rotate the team key (admin only), e.g. right after removing a member: a fresh 32-byte key sealed
+ * to every current roster device (this one included), PUT with a signed commit at epoch + 1.
+ * Returns the new epoch. If another rotation landed first (relay 400/409 and the refetched roster is
+ * already at that epoch or later), an error naming the team's epoch now is thrown (`status` 409,
+ * `epoch`), without retrying.
+ */
+export async function rotate(opts: TeamKeyOptions & { reason: "removed" }): Promise<number> {
+  const roster = await fetchRoster(opts.relayHttp, opts.teamId, opts.session);
+  if (roleOf(roster, opts.session.login) !== "admin") throw Object.assign(new Error("only admins rotate the team key"), { status: 403 });
+  const epoch = roster.epoch + 1;
+  const key = newTeamKey();
+  try {
+    await putKeys(opts, { epoch, wrapped: wrapsFor(opts, epoch, key, allDevices(roster)), commit: epochCommit(opts.id, opts.teamId, epoch, key) });
+  } catch (e) {
+    // A rotation that landed first shows up as 400 ("commit is only for a rotation", same epoch) or 409.
+    const s = statusOf(e);
+    if (s !== 400 && s !== 409) throw e;
+    const now = (await fetchRoster(opts.relayHttp, opts.teamId, opts.session)).epoch;
+    if (now < epoch) throw e;
+    throw Object.assign(new Error(`team key was rotated concurrently; the team is now at epoch ${now}`), { status: 409, epoch: now });
+  }
+  return epoch;
 }

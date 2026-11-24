@@ -1,10 +1,14 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { loadOrCreateIdentity, type DeviceIdentity } from "../src/identity.js";
-import { type TeamRoster, verifyTeamKeys, type WrapEntry } from "../src/teamkeys.js";
-import { epochCommit, newTeamKey, signedWrap } from "./helpers/teamkeys.js";
+import { openFrame, sealFrame } from "../src/teamcrypto.js";
+import { TeamChannel } from "../src/teamchannel.js";
+import { ensureTeamKeys, fetchRoster, fetchTeamKeys, rotate, type TeamRoster, verifyTeamKeys, WAITING_FOR_KEY, type WrapEntry } from "../src/teamkeys.js";
+import { signInTestUser, type TestUser } from "./helpers/signin.js";
+import { epochCommit, keysBody, newTeamKey, signedWrap } from "./helpers/teamkeys.js";
+import { startTestRelay, type TestRelay } from "./helpers/worker.js";
 
 function device(): DeviceIdentity {
   const dir = mkdtempSync(join(tmpdir(), "mindmeld-tk-"));
@@ -99,4 +103,170 @@ describe("verifyTeamKeys", () => {
     expect(out.keys.size).toBe(0);
     expect(out.problems[0]).toMatch(/epoch 1 failed verification/);
   });
+});
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(cond: () => boolean, ms = 10_000) {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("timed out");
+    await sleep(20);
+  }
+}
+
+describe("key distribution and rotation", () => {
+  let relay: TestRelay;
+  beforeAll(async () => {
+    relay = await startTestRelay();
+  }, 60_000);
+  afterAll(async () => {
+    await relay?.stop();
+  }, 30_000);
+  const cleanups: (() => unknown)[] = [];
+  afterEach(async () => {
+    for (const c of cleanups.splice(0)) await c();
+  });
+
+  let n = 0;
+  const user = (base: string) => signInTestUser(relay, `${base}${++n}`);
+  const session = (u: TestUser) => ({ login: u.login, token: u.token, expiresAt: Date.now() / 1000 + 3600 });
+  const opts = (u: TestUser, teamId: string) => ({ relayHttp: relay.url, teamId, session: session(u), id: u.id });
+  const call = async (u: TestUser, method: string, path: string, body?: unknown, status = 200) => {
+    const res = await fetch(`${relay.url}${path}`, {
+      method,
+      headers: { authorization: `Bearer ${u.token}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    expect(res.status, `${method} ${path}`).toBe(status);
+    return res.json() as Promise<any>;
+  };
+  async function newTeam(admin: TestUser, members: TestUser[]) {
+    const { teamId } = await call(admin, "POST", "/v1/teams", { name: "core" });
+    for (const m of members) {
+      await call(admin, "POST", `/v1/teams/${teamId}/invites`, { login: m.login });
+      await call(m, "POST", `/v1/teams/${teamId}/accept`);
+    }
+    return teamId as string;
+  }
+  const keysOf = async (u: TestUser, teamId: string) =>
+    fetchTeamKeys(relay.url, teamId, session(u), u.id, await fetchRoster(relay.url, teamId, session(u)));
+  function channel(u: TestUser, teamId: string) {
+    const ch = new TeamChannel({ ...opts(u, teamId), retry: { baseMs: 50, maxMs: 200 }, noKeyRetryMs: 200 });
+    ch.on("relay-error", () => {});
+    ch.start();
+    cleanups.push(() => ch.stop());
+    return ch;
+  }
+
+  it("first member creates epoch 1", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const teamId = await newTeam(alice, [bob]);
+    expect((await fetchRoster(relay.url, teamId, session(alice))).epoch).toBe(0);
+    // A non-admin cannot create the first key.
+    expect(await ensureTeamKeys(opts(bob, teamId))).toEqual({ waiting: WAITING_FOR_KEY });
+    expect((await fetchRoster(relay.url, teamId, session(alice))).epoch).toBe(0);
+    const a = channel(alice, teamId);
+    await waitFor(() => a.connected);
+    expect(a.epoch).toBe(1);
+    const ak = await keysOf(alice, teamId);
+    const bk = await keysOf(bob, teamId);
+    expect(ak.problems).toEqual([]);
+    expect(bk.problems).toEqual([]);
+    expect(bk.keys.get(1)).toEqual(ak.keys.get(1));
+    expect(ak.keys.get(1)?.length).toBe(32);
+    expect(await ensureTeamKeys(opts(bob, teamId))).toBe("ok");
+    expect(await ensureTeamKeys(opts(alice, teamId))).toBe("ok");
+    expect((await fetchRoster(relay.url, teamId, session(alice))).epoch).toBe(1);
+  }, 30_000);
+
+  it("pending device gets the key when a member comes online", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const teamId = await newTeam(alice, []);
+    expect(await ensureTeamKeys(opts(alice, teamId))).toBe("ok"); // epoch 1, alice only
+    // Bob accepts while alice is offline.
+    await call(alice, "POST", `/v1/teams/${teamId}/invites`, { login: bob.login });
+    await call(bob, "POST", `/v1/teams/${teamId}/accept`);
+    const b = channel(bob, teamId);
+    await waitFor(() => b.status === WAITING_FOR_KEY);
+    expect(WAITING_FOR_KEY).toBe("waiting for a teammate to come online to give this device the team key");
+    expect(b.connected).toBe(false);
+    await sleep(300);
+    expect(b.connected).toBe(false);
+    // Alice comes online and delivers the key; bob's channel connects on its own.
+    const a = channel(alice, teamId);
+    await waitFor(() => a.connected && b.connected);
+    expect(b.status).toBeNull();
+    const roster = await fetchRoster(relay.url, teamId, session(bob));
+    expect(roster.members.flatMap((m) => m.devices).every((d) => d.hasKey)).toBe(true);
+    expect((await keysOf(bob, teamId)).keys.get(1)).toEqual((await keysOf(alice, teamId)).keys.get(1));
+  }, 30_000);
+
+  it("concurrent delivery by two members both succeed", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const carol = await user("carol");
+    const teamId = await newTeam(alice, [bob]);
+    expect(await ensureTeamKeys(opts(alice, teamId))).toBe("ok");
+    await call(alice, "POST", `/v1/teams/${teamId}/invites`, { login: carol.login });
+    await call(carol, "POST", `/v1/teams/${teamId}/accept`);
+    const results = await Promise.all([ensureTeamKeys(opts(alice, teamId)), ensureTeamKeys(opts(bob, teamId))]);
+    expect(results).toEqual(["ok", "ok"]);
+    const ck = await keysOf(carol, teamId);
+    expect(ck.problems).toEqual([]);
+    expect(ck.keys.has(1)).toBe(true);
+  }, 30_000);
+
+  it("rotation after removal is readable by remaining devices only", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const carol = await user("carol");
+    const teamId = await newTeam(alice, [bob, carol]);
+    expect(await ensureTeamKeys(opts(alice, teamId))).toBe("ok");
+    const bobKeys = await keysOf(bob, teamId);
+    expect([...bobKeys.keys.keys()]).toEqual([1]);
+    // Only admins rotate.
+    await expect(rotate({ ...opts(carol, teamId), reason: "removed" })).rejects.toThrow(/admin/);
+
+    await call(alice, "DELETE", `/v1/teams/${teamId}/members/${bob.login}`);
+    expect(await rotate({ ...opts(alice, teamId), reason: "removed" })).toBe(2);
+
+    const ak = await keysOf(alice, teamId);
+    const ck = await keysOf(carol, teamId);
+    expect(ak.epoch).toBe(2);
+    expect(ck.problems).toEqual([]);
+    expect(ck.keys.get(2)).toEqual(ak.keys.get(2));
+    expect(ck.keys.get(2)).not.toEqual(ck.keys.get(1));
+    await call(bob, "GET", `/v1/teams/${teamId}/keys`, undefined, 403);
+
+    const f = sealFrame(2, ak.keys.get(2)!, alice.id, "after-rotation");
+    const roster = new Map([[alice.id.deviceId, { login: alice.login, signPub: alice.id.signPub }]]);
+    expect(openFrame(f, ck.keys, roster)?.payload).toBe("after-rotation");
+    expect(openFrame(f, bobKeys.keys, roster)).toBeNull();
+    for (const k of bobKeys.keys.values()) expect(openFrame(f, new Map([[2, k]]), roster)).toBeNull();
+  }, 30_000);
+
+  it("a concurrent rotation is reported, not retried", async () => {
+    const alice = await user("alice");
+    const teamId = await newTeam(alice, []);
+    expect(await ensureTeamKeys(opts(alice, teamId))).toBe("ok");
+    const real = globalThis.fetch;
+    let raced = false;
+    // Just before alice's rotation PUT lands, someone else rotates to epoch 2.
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (!raced && init?.method === "PUT") {
+        raced = true;
+        await real(`${relay.url}/v1/teams/${teamId}/keys`, {
+          method: "PUT",
+          headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+          body: JSON.stringify(keysBody(alice.id, teamId, 2, newTeamKey(), [alice.id])),
+        });
+      }
+      return real(input, init);
+    }) as typeof fetch;
+    cleanups.push(() => (globalThis.fetch = real));
+    await expect(rotate({ ...opts(alice, teamId), reason: "removed" })).rejects.toThrow(/rotated concurrently.*epoch 2/);
+    expect((await fetchRoster(relay.url, teamId, session(alice))).epoch).toBe(2);
+  }, 30_000);
 });

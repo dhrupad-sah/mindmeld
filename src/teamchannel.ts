@@ -6,7 +6,7 @@ import type { Channel, PayloadSender, ServerInfo } from "./channel.js";
 import type { DeviceIdentity } from "./identity.js";
 import { Payload, PING_INTERVAL_MS } from "./protocol.js";
 import { openFrame, sealFrame, type TeamFrame } from "./teamcrypto.js";
-import { fetchRoster, fetchTeamKeys, httpBase, rosterDevices } from "./teamkeys.js";
+import { distributeKeys, fetchRoster, fetchTeamKeys, httpBase, rosterDevices, WAITING_FOR_KEY } from "./teamkeys.js";
 
 export interface TeamChannelOptions {
   /** Relay base URL (http(s):// or ws(s)://). */
@@ -16,6 +16,8 @@ export interface TeamChannelOptions {
   id: DeviceIdentity;
   /** Reconnect backoff (tests shrink it). Default: 2s doubling to 60s. */
   retry?: { baseMs: number; maxMs: number };
+  /** Wait before retrying while this device has no team key (tests shrink it). Default 30s. */
+  noKeyRetryMs?: number;
 }
 
 /** Shown when the relay refuses the session token (or it has expired locally). */
@@ -51,13 +53,18 @@ const CLOSE_TIMEOUT_MS = 1000;
 const NO_KEY_RETRY_MS = 30_000;
 /** Frames for an epoch this client has no key for yet, held until the next key refresh. */
 const MAX_HELD = 64;
+/** Key-distribution passes per refresh (each write is followed by a refetch). */
+const MAX_DISTRIBUTE_PASSES = 3;
 
 /**
  * The team transport: one socket at /v1/teams/:id/ws (bearer token in the Authorization header).
  * Every frame is sealed with the current epoch's team key and signed by this device; incoming frames
  * are verified with `openFrame` against the roster, and the sender's login comes from that signature.
  * The roster and verified keys are fetched on start, on reconnect, and whenever the relay says the
- * roster changed. Emits the Channel events plus "closed" (code, reason) and "status" (reason | null).
+ * roster changed. Each fetch is followed by `distributeKeys` (see `ensureTeamKeys`): an admin creates
+ * the first key, a device holding the key delivers it to roster devices that lack one, and a device
+ * without one reports WAITING_FOR_KEY as its status until a teammate delivers it (picked up on the
+ * no-key retry). Emits the Channel events plus "closed" (code, reason) and "status" (reason | null).
  */
 export class TeamChannel extends EventEmitter implements Channel {
   private ws: WebSocket | null = null;
@@ -74,6 +81,8 @@ export class TeamChannel extends EventEmitter implements Channel {
   private refreshing: Promise<void> | null = null;
   private refreshAgain = false;
   private keyProblems: string[] = [];
+  /** The last refresh found no usable key for the current epoch. */
+  private waiting = false;
   private reason: string | null = null;
   private retryTimer: NodeJS.Timeout | null = null;
   /** Consecutive failed connection attempts; reset once the relay admits this device. */
@@ -158,12 +167,13 @@ export class TeamChannel extends EventEmitter implements Channel {
   }
 
   /**
-   * Why the channel is not working normally, for the status line: "no team key yet", "removed from
-   * team", or a key verification failure such as "team key for epoch 3 failed verification (...)".
-   * Null when all is well.
+   * Why the channel is not working normally, for the status line: WAITING_FOR_KEY, "no team key
+   * yet", "removed from team", or a key verification failure such as "team key for epoch 3 failed
+   * verification (...)". Null when all is well.
    */
   get status(): string | null {
-    return this.reason ?? this.keyProblems.find((p) => p.includes(`epoch ${this.currentEpoch} `)) ?? null;
+    const problem = this.keyProblems.find((p) => p.includes(`epoch ${this.currentEpoch} `));
+    return this.reason ?? problem ?? (this.waiting && !this.admitted ? WAITING_FOR_KEY : null);
   }
 
   send(p: Payload): void {
@@ -188,14 +198,27 @@ export class TeamChannel extends EventEmitter implements Channel {
     }
     this.refreshing = (async () => {
       try {
+        let passes = 0;
         do {
           this.refreshAgain = false;
           const { relayHttp, teamId, session, id } = this.opts;
           const roster = await fetchRoster(relayHttp, teamId, session);
           const k = await fetchTeamKeys(relayHttp, teamId, session, id, roster);
+          if (passes++ < MAX_DISTRIBUTE_PASSES) {
+            try {
+              if ((await distributeKeys({ relayHttp, teamId, session, id }, roster, k)).wrote) this.refreshAgain = true;
+            } catch (e) {
+              const s = (e as { status?: number }).status;
+              if (s === 401 || s === 403 || s === 404) throw e;
+              // A race (400/409) or a relay hiccup: report it and look again; the channel still works.
+              this.emit("relay-error", e);
+              this.refreshAgain = true;
+            }
+          }
           this.roster = rosterDevices(roster);
           this.keys = k.keys;
           this.currentEpoch = Math.max(k.epoch, roster.epoch);
+          this.waiting = !this.keys.has(this.currentEpoch) && !k.problems.some((p) => p.includes(`epoch ${this.currentEpoch} `));
           for (const p of k.problems) if (!this.keyProblems.includes(p)) this.emit("key-problem", p);
           this.keyProblems = k.problems;
           this.emit("status", this.status);
@@ -267,8 +290,8 @@ export class TeamChannel extends EventEmitter implements Channel {
       if (code === TEAM_CLOSE.noTeam) return this.terminal(code, "no such team");
       this.emit("closed", code, reason);
       if (code === TEAM_CLOSE.noKey) {
-        this.setReason("no team key yet");
-        return this.scheduleRetry(NO_KEY_RETRY_MS);
+        this.setReason(this.waiting ? WAITING_FOR_KEY : "no team key yet");
+        return this.scheduleRetry(this.opts.noKeyRetryMs ?? NO_KEY_RETRY_MS);
       }
       this.scheduleRetry();
     });

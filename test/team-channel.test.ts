@@ -4,7 +4,7 @@ import { Daemon } from "../src/daemon.js";
 import type { Payload } from "../src/protocol.js";
 import { openFrame, sealFrame, type TeamFrame } from "../src/teamcrypto.js";
 import { backoffDelay, SIGN_IN_EXPIRED, TeamChannel } from "../src/teamchannel.js";
-import { fetchRoster, fetchTeamKeys } from "../src/teamkeys.js";
+import { fetchRoster, fetchTeamKeys, WAITING_FOR_KEY } from "../src/teamkeys.js";
 import { signInTestUser, type TestUser } from "./helpers/signin.js";
 import { keysBody, newTeamKey } from "./helpers/teamkeys.js";
 import { startTestRelay, type TestRelay } from "./helpers/worker.js";
@@ -184,7 +184,7 @@ describe("team channel", () => {
     await waitFor(() => d.closes.length > 0);
     expect(d.closes[0]).toEqual({ code: 4003, reason: "no team key yet" });
     expect(d.ch.connected).toBe(false);
-    expect(d.ch.status).toBe("no team key yet");
+    expect(d.ch.status).toBe(WAITING_FOR_KEY);
   }, 30_000);
 
   it("non-members are refused and sockets need a token", async () => {
