@@ -34,7 +34,8 @@
     "@types/ws": "^8.18.2",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.12"
+    "vitest": "^4.1.12",
+    "wrangler": "^4.153.0"
   },
   "keywords": [
     "mindmeld",
