@@ -309,7 +309,7 @@ export class Daemon extends EventEmitter {
     const from = this.nameOf(ask.from, ask.fromName, login);
     this.emit("question", { from, question: ask.question });
     try {
-      const d = await this.opts.decide({ ...ask, from }, report);
+      const d = await this.opts.decide({ ...ask, from, fromName: from }, report);
       this.emit("handled", { from, question: ask.question, action: d.action });
       reply(d);
     } catch (e) {
