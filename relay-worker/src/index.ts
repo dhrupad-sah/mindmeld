@@ -1,4 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
+import { handleAuth, type AuthEnv } from "./auth.js";
+
+export { Users } from "./auth.js";
 
 /**
  * mindmeld relay on Cloudflare: same protocol as `mindmeld relay` (src/relay.ts).
@@ -6,10 +9,11 @@ import { DurableObject } from "cloudflare:workers";
  *   connect with `?v=<version>`: they get version info, connection ids and joined/left events,
  *   and are kept apart from older clients, which keep seeing each other as before.
  * - /pair/<rendezvous>: one-time handshake room for exactly two sockets.
+ * - /v1/auth/github, /v1/me: GitHub sign-in and mindmeld session tokens (src/auth.ts).
  * Frames are end-to-end encrypted; nothing is stored. One Durable Object per room.
  */
 
-interface Env {
+interface Env extends AuthEnv {
   ROOMS: DurableObjectNamespace<Room>;
   LATEST_VERSION: string;
   MIN_VERSION: string;
@@ -46,6 +50,9 @@ function trySend(ws: WebSocket, msg: string): void {
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const { pathname } = new URL(req.url);
+    if (pathname.startsWith("/v1/")) {
+      return (await handleAuth(req, env, pathname)) ?? new Response("not found\n", { status: 404 });
+    }
     const room = ROOM_PATH.exec(pathname);
     const pair = PAIR_PATH.exec(pathname);
     if (!room && !pair) {
