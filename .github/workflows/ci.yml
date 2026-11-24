@@ -9,6 +9,8 @@ jobs:
   test:
     name: ${{ matrix.os }} / node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
+    # A hung test should fail fast with a log, not be cancelled silently at the runner limit.
+    timeout-minutes: 12
     strategy:
       fail-fast: false
       matrix:
@@ -23,7 +25,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       # pretest rebuilds the plugin bundle, so the bundle test checks what we'd ship
-      - run: npm test
+      - run: npm test -- --reporter=verbose
+        timeout-minutes: 8
 
   relay-worker:
     runs-on: ubuntu-latest
