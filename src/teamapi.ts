@@ -129,11 +129,11 @@ export function inviteMessage(login: string, teamName: string): string {
   ].join("\n");
 }
 
-const roleText = (roster: TeamRoster, login: string) => roster.members.find((m) => m.login === normLogin(login))?.role;
+const roleText = (roster: TeamRoster, uid: number) => roster.members.find((m) => m.uid === uid)?.role;
 
-/** "Team: core (you're admin)". */
-export function teamLine(name: string, roster: TeamRoster | null, login: string | null): string {
-  const role = roster && login ? roleText(roster, login) : undefined;
+/** "Team: core (you're admin)". `uid` is the signed-in GitHub id. */
+export function teamLine(name: string, roster: TeamRoster | null, uid: number | null): string {
+  const role = roster && uid !== null ? roleText(roster, uid) : undefined;
   return role ? `Team: ${name} (you're ${role})` : `Team: ${name}`;
 }
 
@@ -149,10 +149,10 @@ const EVENTS: Record<string, (by: string, subject: string) => string> = {
 };
 
 /** The `team` tool's text: members, roles, devices (fingerprint, key), invites and the recent log. */
-export function formatTeam(roster: TeamRoster, me: { login: string; deviceId: string }): string {
+export function formatTeam(roster: TeamRoster, me: { uid: number; deviceId: string }): string {
   const lines = [`Team: ${roster.name} (key epoch ${roster.epoch})`, "", "Members:"];
   for (const m of roster.members) {
-    lines.push(`- @${m.login} (${m.role})${m.login === normLogin(me.login) ? " (you)" : ""}`);
+    lines.push(`- @${m.login} (${m.role})${m.uid === me.uid ? " (you)" : ""}`);
     if (m.devices.length === 0) lines.push("    no devices");
     for (const d of m.devices) {
       const key = d.hasKey ? "has the team key" : "waiting for the team key";

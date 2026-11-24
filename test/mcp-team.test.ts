@@ -225,7 +225,7 @@ describe("team tools over MCP", () => {
 
   it("an expired sign-in says so in status and in other tools", async () => {
     const { dir } = await home();
-    writeFileSync(join(dir, "session.json"), JSON.stringify({ login: "erin", token: "t", expiresAt: Math.floor(Date.now() / 1000) - 60, relay: relay.url }));
+    writeFileSync(join(dir, "session.json"), JSON.stringify({ uid: 42, login: "erin", token: "t", expiresAt: Math.floor(Date.now() / 1000) - 60, relay: relay.url }));
     writeFileSync(join(dir, "config.json"), JSON.stringify({ relay: relay.url, name: "erin", teamRelay: relay.url, team: { teamId: "0123456789abcdef", name: "core" } }));
     const s = server(dir);
     const st = await s.call("status");

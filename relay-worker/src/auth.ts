@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { ed25519 } from "@noble/curves/ed25519.js";
+import type { Team } from "./team.js";
 
 /**
  * GitHub sign-in for the relay.
@@ -7,16 +8,20 @@ import { ed25519 } from "@noble/curves/ed25519.js";
  * - POST /v1/auth/github { githubToken, device: { deviceId, signPub, boxPub }, nonce, proof } first
  *   checks the nonce and that `proof` is an Ed25519 signature by signPub over
  *   utf8("mm-auth|v1|" + nonce + "|" + deviceId) (proof of possession), then checks the GitHub
- *   token against `${GITHUB_API_BASE}/user`, records the device under that login (Users Durable
- *   Object, one per login) and returns { login, token, expiresAt }. The GitHub token is used once
- *   and never stored.
- * - GET /v1/me with `Authorization: Bearer <token>` returns { login, deviceId }.
- * Token: base64url(JSON {login, deviceId, exp}) + "." + base64url(HMAC-SHA256(TOKEN_SIGNING_KEY, first part)).
+ *   token against `${GITHUB_API_BASE}/user`, records the device under that account's numeric id
+ *   (Users Durable Object "uid:<id>"), refreshes the login shown in the caller's teams, and returns
+ *   { uid, login, token, expiresAt }. The GitHub token is used once and never stored.
+ * - GET /v1/me with `Authorization: Bearer <token>` returns { uid, login, deviceId }.
+ * Identity is GitHub's numeric user id (`uid`): logins can be renamed and re-registered by someone
+ * else, ids can't. The login is carried along for display and for login-addressed invites.
+ * Token: base64url(JSON {uid, login, deviceId, exp}) + "." + base64url(HMAC-SHA256(TOKEN_SIGNING_KEY, first part)).
  * `exp` and `expiresAt` are unix time in SECONDS.
  */
 
 export interface AuthEnv {
   USERS: DurableObjectNamespace<Users>;
+  /** Teams, so a sign-in can refresh the login its teams show. */
+  TEAMS: DurableObjectNamespace<Team>;
   GITHUB_API_BASE: string;
   TOKEN_SIGNING_KEY: string;
 }
@@ -43,6 +48,14 @@ export interface DeviceRecord {
   signPub: string;
   boxPub: string;
 }
+
+/** The Users object holding an account's devices and team memberships. */
+export const usersByUid = (env: AuthEnv, uid: number) => env.USERS.get(env.USERS.idFromName(`uid:${uid}`));
+/** The Users object holding pending invites addressed to a login (invites name logins). */
+export const invitesByLogin = (env: AuthEnv, login: string) => env.USERS.get(env.USERS.idFromName(`login:${login.toLowerCase()}`));
+
+/** True for a GitHub numeric user id. */
+export const isUid = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
 
 /** A login's standing in a team, as kept in its Users index. */
 export type TeamIndexRole = "admin" | "member" | "invited";
@@ -125,16 +138,16 @@ function verifyDeviceProof(dev: DeviceRecord, nonce: string, proof: string): boo
   }
 }
 
-/** Issue a session token for `login` on `deviceId`, valid TOKEN_TTL_SECONDS. */
-export async function issueToken(login: string, deviceId: string, env: AuthEnv): Promise<{ token: string; expiresAt: number }> {
+/** Issue a session token for account `uid` (shown as `login`) on `deviceId`, valid TOKEN_TTL_SECONDS. */
+export async function issueToken(uid: number, login: string, deviceId: string, env: AuthEnv): Promise<{ token: string; expiresAt: number }> {
   const exp = Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS;
-  const body = b64urlEncode(new TextEncoder().encode(JSON.stringify({ login, deviceId, exp })));
+  const body = b64urlEncode(new TextEncoder().encode(JSON.stringify({ uid, login, deviceId, exp })));
   const sig = new Uint8Array(await crypto.subtle.sign("HMAC", await signingKey(env), new TextEncoder().encode(body)));
   return { token: `${body}.${b64urlEncode(sig)}`, expiresAt: exp };
 }
 
 /** Check a session token's signature (constant time, via WebCrypto verify), shape and expiry. */
-export async function verifyToken(token: string, env: AuthEnv): Promise<{ login: string; deviceId: string } | null> {
+export async function verifyToken(token: string, env: AuthEnv): Promise<{ uid: number; login: string; deviceId: string } | null> {
   if (typeof token !== "string" || token.length > 1024) return null;
   const parts = token.split(".");
   if (parts.length !== 2) return null;
@@ -152,11 +165,12 @@ export async function verifyToken(token: string, env: AuthEnv): Promise<{ login:
     return null;
   }
   if (!p || typeof p !== "object") return null;
-  const { login, deviceId, exp } = p as Record<string, unknown>;
+  const { uid, login, deviceId, exp } = p as Record<string, unknown>;
+  if (!isUid(uid)) return null;
   if (typeof login !== "string" || !GITHUB_LOGIN.test(login)) return null;
   if (typeof deviceId !== "string" || !HEX16.test(deviceId)) return null;
   if (typeof exp !== "number" || !Number.isSafeInteger(exp) || exp <= Math.floor(Date.now() / 1000)) return null;
-  return { login, deviceId };
+  return { uid, login, deviceId };
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -175,8 +189,8 @@ async function parseDevice(v: unknown): Promise<DeviceRecord | null> {
   return { deviceId, signPub, boxPub };
 }
 
-/** Ask GitHub who owns this token. "denied" on 401/403, "error" when GitHub misbehaves. */
-async function githubLogin(githubToken: string, env: AuthEnv): Promise<string | "denied" | "error"> {
+/** Ask GitHub who owns this token (numeric id and login). "denied" on 401/403, "error" when GitHub misbehaves. */
+async function githubUser(githubToken: string, env: AuthEnv): Promise<{ uid: number; login: string } | "denied" | "error"> {
   let res: Response;
   try {
     res = await fetch(`${env.GITHUB_API_BASE}/user`, {
@@ -192,8 +206,8 @@ async function githubLogin(githubToken: string, env: AuthEnv): Promise<string | 
   if (res.status === 401 || res.status === 403) return "denied";
   if (!res.ok) return "error";
   try {
-    const { login } = (await res.json()) as { login?: unknown };
-    return typeof login === "string" && GITHUB_LOGIN.test(login) ? login : "error";
+    const { login, id } = (await res.json()) as { login?: unknown; id?: unknown };
+    return typeof login === "string" && GITHUB_LOGIN.test(login) && isUid(id) ? { uid: id, login } : "error";
   } catch {
     return "error";
   }
@@ -224,15 +238,22 @@ async function signIn(req: Request, env: AuthEnv): Promise<Response> {
   // Proof of possession before anything is recorded or GitHub is even asked.
   if (!(await verifyChallenge(nonce, env))) return json(401, { error: "challenge expired or invalid" });
   if (!verifyDeviceProof(dev, nonce, proof)) return json(401, { error: "device proof failed" });
-  const login = await githubLogin(githubToken, env);
-  if (login === "denied") return json(401, { error: "github sign-in failed" });
-  if (login === "error") return json(502, { error: "github unavailable" });
-  // GitHub logins are case-insensitive: one Users object per lowercased login.
-  const users = env.USERS.get(env.USERS.idFromName(login.toLowerCase()));
+  const gh = await githubUser(githubToken, env);
+  if (gh === "denied") return json(401, { error: "github sign-in failed" });
+  if (gh === "error") return json(502, { error: "github unavailable" });
+  const { uid, login } = gh;
+  // One Users object per GitHub account (numeric id): a renamed login keeps its devices and teams.
+  const users = usersByUid(env, uid);
   const added = await users.addDevice(login, dev);
   if (!added) return json(409, { error: "device id already registered with different keys" });
-  const { token, expiresAt } = await issueToken(login, dev.deviceId, env);
-  return json(200, { login, token, expiresAt });
+  // Best effort: the teams this account is in show its current login (Team.guard also refreshes it).
+  for (const t of await users.teams()) {
+    try {
+      await env.TEAMS.get(env.TEAMS.idFromName(t.teamId)).refreshLogin(uid, login.toLowerCase());
+    } catch {}
+  }
+  const { token, expiresAt } = await issueToken(uid, login, dev.deviceId, env);
+  return json(200, { uid, login, token, expiresAt });
 }
 
 async function whoami(req: Request, env: AuthEnv): Promise<Response> {
@@ -252,7 +273,10 @@ export async function handleAuth(req: Request, env: AuthEnv, pathname: string): 
   return null;
 }
 
-/** One per GitHub login (keyed by the lowercased login): the devices that signed in as it. */
+/**
+ * One per GitHub account, named "uid:<id>": its devices and its team memberships. Objects named
+ * "login:<lowercased login>" hold only the pending invites addressed to that login.
+ */
 export class Users extends DurableObject<AuthEnv> {
   constructor(ctx: DurableObjectState, env: AuthEnv) {
     super(ctx, env);
@@ -264,7 +288,7 @@ export class Users extends DurableObject<AuthEnv> {
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS teams (team_id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL)");
   }
 
-  /** Record this login's role in a team ("admin", "member" or "invited"), or drop the entry when role is null. */
+  /** Record this account's (or, for a "login:" object, this login's) role in a team ("admin", "member" or "invited"), or drop the entry when role is null. */
   setTeam(teamId: string, name: string, role: TeamIndexRole | null): void {
     const sql = this.ctx.storage.sql;
     if (role === null) sql.exec("DELETE FROM teams WHERE team_id = ?", teamId);

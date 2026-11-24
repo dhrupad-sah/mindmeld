@@ -35,9 +35,9 @@ const roster: TeamRoster = {
   invites: [],
   log: [],
   members: [
-    { login: "ann", role: "admin", devices: [dev(admin)] },
-    { login: "max", role: "member", devices: [dev(member)] },
-    { login: "me", role: "member", devices: [dev(me)] },
+    { uid: 1, login: "ann", role: "admin", devices: [dev(admin)] },
+    { uid: 2, login: "max", role: "member", devices: [dev(member)] },
+    { uid: 3, login: "me", role: "member", devices: [dev(me)] },
   ],
 };
 
@@ -129,7 +129,7 @@ describe("key distribution and rotation", () => {
 
   let n = 0;
   const user = (base: string) => signInTestUser(relay, `${base}${++n}`);
-  const session = (u: TestUser) => ({ login: u.login, token: u.token, expiresAt: Date.now() / 1000 + 3600, relay: relay.url });
+  const session = (u: TestUser) => ({ uid: u.uid, login: u.login, token: u.token, expiresAt: Date.now() / 1000 + 3600, relay: relay.url });
   const opts = (u: TestUser, teamId: string) => ({ relayHttp: relay.url, teamId, session: session(u), id: u.id });
   const call = async (u: TestUser, method: string, path: string, body?: unknown, status = 200) => {
     const res = await fetch(`${relay.url}${path}`, {
@@ -270,7 +270,7 @@ describe("key distribution and rotation", () => {
     const carol = await user("carol");
     const teamId = await newTeam(alice, [carol]);
     expect(await ensureTeamKeys(opts(alice, teamId))).toBe("ok");
-    const carol2 = await signInTestUser(relay, carol.login); // a second device for carol
+    const carol2 = await signInTestUser(relay, carol.login, carol.uid); // a second device for carol
     const real = globalThis.fetch;
     let injected = false;
     globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {

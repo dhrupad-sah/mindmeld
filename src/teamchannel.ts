@@ -41,13 +41,13 @@ export const TEAM_CLOSE = { removed: 4001, noKey: 4003, noTeam: 4004, signedOut:
 
 const TeamFrameSchema = z.object({ e: z.number().int(), dev: z.string(), d: z.string(), sig: z.string() });
 
-/** What the relay sends on a team socket. `c` and `login` are routing hints only, never identity. */
+/** What the relay sends on a team socket. `c`, `uid` and `login` are routing hints only, never identity. */
 const TeamMessage = z.discriminatedUnion("t", [
   z.object({ t: z.literal("server"), latest: z.string(), minimum: z.string(), epoch: z.number() }),
-  z.object({ t: z.literal("joined"), c: z.string(), login: z.string() }),
-  z.object({ t: z.literal("left"), c: z.string(), login: z.string() }),
+  z.object({ t: z.literal("joined"), c: z.string(), uid: z.number().int(), login: z.string() }),
+  z.object({ t: z.literal("left"), c: z.string(), uid: z.number().int(), login: z.string() }),
   z.object({ t: z.literal("roster") }),
-  z.object({ t: z.literal("msg"), f: TeamFrameSchema, c: z.string(), login: z.string() }),
+  z.object({ t: z.literal("msg"), f: TeamFrameSchema, c: z.string(), uid: z.number().int(), login: z.string() }),
 ]);
 
 const RETRY_BASE_MS = 2000;
@@ -67,7 +67,7 @@ const MAX_DISTRIBUTE_PASSES = 3;
 /**
  * The team transport: one socket at /v1/teams/:id/ws (bearer token in the Authorization header).
  * Every frame is sealed with the current epoch's team key and signed by this device; incoming frames
- * are verified with `openFrame` against the roster, and the sender's login comes from that signature.
+ * are verified with `openFrame` against the roster, and the sender (GitHub id, and login for display) comes from that signature.
  * The roster and verified keys are fetched on start, on reconnect, and whenever the relay says the
  * roster changed. Each fetch is followed by `distributeKeys` (see `ensureTeamKeys`): an admin creates
  * the first key, a device holding the key delivers it to roster devices that lack one, and a device
@@ -80,12 +80,12 @@ export class TeamChannel extends EventEmitter implements Channel {
   private serverInfo: ServerInfo | null = null;
   private admitted = false;
   private stopped = false;
-  private roster = new Map<string, { login: string; signPub: string }>();
+  private roster = new Map<string, { uid: number; login: string; signPub: string }>();
   private keys = new Map<number, Uint8Array>();
   private currentEpoch = 0;
-  /** Relay connection id -> the verified login of its first frame. */
-  private readonly cidLogin = new Map<string, string>();
-  private held: { f: TeamFrame; c: string; login: string }[] = [];
+  /** Relay connection id -> the verified GitHub id of its first frame. */
+  private readonly cidUid = new Map<string, number>();
+  private held: { f: TeamFrame; c: string; uid: number }[] = [];
   private refreshing: Promise<void> | null = null;
   private refreshAgain = false;
   private keyProblems: string[] = [];
@@ -238,7 +238,7 @@ export class TeamChannel extends EventEmitter implements Channel {
         this.refreshing = null;
       }
       const held = this.held.splice(0);
-      for (const h of held) this.receive(h.f, h.c, h.login, false);
+      for (const h of held) this.receive(h.f, h.c, h.uid, false);
     })();
     return this.refreshing;
   }
@@ -289,7 +289,7 @@ export class TeamChannel extends EventEmitter implements Channel {
       if (this.pingTimer) clearInterval(this.pingTimer);
       const wasAdmitted = this.admitted;
       this.admitted = false;
-      this.cidLogin.clear();
+      this.cidUid.clear();
       const reason = buf.toString();
       // Always reported once admitted, even when stopped, so the daemon can drop its peers.
       if (wasAdmitted) this.emit("disconnected");
@@ -337,34 +337,35 @@ export class TeamChannel extends EventEmitter implements Channel {
         this.emit("joined", msg.c);
         break;
       case "left":
-        this.cidLogin.delete(msg.c);
+        this.cidUid.delete(msg.c);
         this.emit("left", msg.c);
         break;
       case "roster":
         void this.refresh().catch((e) => this.refreshFailed(e));
         break;
       case "msg":
-        this.receive(msg.f, msg.c, msg.login, true);
+        this.receive(msg.f, msg.c, msg.uid, true);
         break;
     }
   }
 
   /**
-   * Verify and deliver one frame. The login is the one the signature proves (via the roster); the
-   * relay's stamp must agree with it, and a connection id stays bound to the login of its first frame.
+   * Verify and deliver one frame. The sender is the GitHub id the signature proves (via the roster);
+   * the relay's uid stamp must agree with it, and a connection id stays bound to the uid of its first
+   * frame. The login delivered with it is the roster's, for display.
    */
-  private receive(f: TeamFrame, c: string, stamped: string, mayHold: boolean): void {
+  private receive(f: TeamFrame, c: string, stamped: number, mayHold: boolean): void {
     if (mayHold && !this.keys.has(f.e) && f.e > this.currentEpoch) {
       // Probably a rotation this client has not caught up with yet.
-      if (this.held.length < MAX_HELD) this.held.push({ f, c, login: stamped });
+      if (this.held.length < MAX_HELD) this.held.push({ f, c, uid: stamped });
       void this.refresh().catch((e) => this.refreshFailed(e));
       return;
     }
     const opened = openFrame(f, this.keys, this.roster);
     if (!opened) return;
-    if (opened.login !== stamped) return;
-    const bound = this.cidLogin.get(c);
-    if (bound !== undefined && bound !== opened.login) return;
+    if (opened.uid !== stamped) return;
+    const bound = this.cidUid.get(c);
+    if (bound !== undefined && bound !== opened.uid) return;
     let p: Payload;
     try {
       const parsed = Payload.safeParse(JSON.parse(opened.payload));
@@ -373,7 +374,7 @@ export class TeamChannel extends EventEmitter implements Channel {
     } catch {
       return;
     }
-    this.cidLogin.set(c, opened.login);
-    this.emit("payload", p, { cid: c, login: opened.login } satisfies PayloadSender);
+    this.cidUid.set(c, opened.uid);
+    this.emit("payload", p, { cid: c, login: opened.login, uid: opened.uid } satisfies PayloadSender);
   }
 }

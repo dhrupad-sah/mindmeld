@@ -227,7 +227,7 @@ export class Daemon extends EventEmitter {
     }
   }
 
-  /** False if `login` is set and the peer id was first seen from a different login; binds it otherwise. */
+  /** False if `login` (a verified identity key) is set and the peer id was first seen from a different one; binds it otherwise. */
   private ownsPeer(peerId: string, login: string | undefined): boolean {
     if (login === undefined) return true;
     const owner = this.peerOwner.get(peerId);
@@ -243,9 +243,11 @@ export class Daemon extends EventEmitter {
   }
 
   private handlePayload(p: Payload, from: PayloadSender): void {
-    // An authenticated login beats any name the payload claims for itself.
+    // An authenticated login beats any name the payload claims for itself (it is the display name).
     const login = from.login;
-    if ((p.type === "hello" || p.type === "bye") && !this.ownsPeer(p.peer, login)) return;
+    // Ownership binds to the most stable verified identity: the GitHub id on a team, else the login.
+    const owner = from.uid !== undefined ? `uid:${from.uid}` : login;
+    if ((p.type === "hello" || p.type === "bye") && !this.ownsPeer(p.peer, owner)) return;
     switch (p.type) {
       case "hello": {
         const isNew = !this.peers.has(p.peer);
@@ -267,11 +269,11 @@ export class Daemon extends EventEmitter {
         break;
       case "ask":
         // Only a shared session answers, and only questions addressed to it (or legacy broadcasts).
-        if (this.share && (!p.to || p.to === this.opts.name || p.to === this.peerId)) void this.handleAsk(p, login);
+        if (this.share && (!p.to || p.to === this.opts.name || p.to === this.peerId)) void this.handleAsk(p, login, owner);
         break;
       case "status": {
         const pending = this.pending.get(p.id);
-        if (pending && this.fromTarget(pending, login)) {
+        if (pending && this.fromTarget(pending, owner)) {
           pending.acked = true;
           pending.onStatus?.(p.state);
         }
@@ -279,7 +281,7 @@ export class Daemon extends EventEmitter {
       }
       case "answer": {
         const pending = this.pending.get(p.id);
-        if (pending && this.fromTarget(pending, login)) {
+        if (pending && this.fromTarget(pending, owner)) {
           this.pending.delete(p.id);
           pending.resolve({ from: this.nameOf(p.from, undefined, login), text: p.text });
         }
@@ -287,7 +289,7 @@ export class Daemon extends EventEmitter {
       }
       case "decline": {
         const pending = this.pending.get(p.id);
-        if (!pending || !this.fromTarget(pending, login)) break;
+        if (!pending || !this.fromTarget(pending, owner)) break;
         pending.declines.push(`${this.nameOf(p.from, undefined, login)}: ${p.reason}`);
         if (pending.declines.length >= pending.expected) {
           this.pending.delete(p.id);
@@ -319,7 +321,7 @@ export class Daemon extends EventEmitter {
 
   private readonly seenAsks = new Set<string>();
 
-  private async handleAsk(ask: Ask, login?: string): Promise<void> {
+  private async handleAsk(ask: Ask, login?: string, owner?: string): Promise<void> {
     if (this.seenAsks.has(ask.id)) return; // a resend of a question already being handled
     this.seenAsks.add(ask.id);
     const reply = (d: Decision) =>
@@ -329,8 +331,8 @@ export class Daemon extends EventEmitter {
 
     const report = (state: AskState) => this.send({ type: "status", id: ask.id, from: this.peerId, state });
     report("received");
-    // A verified login cannot dodge the limit by rotating peer ids.
-    if (this.rateLimited(login ?? ask.from)) {
+    // A verified identity cannot dodge the limit by rotating peer ids.
+    if (this.rateLimited(owner ?? login ?? ask.from)) {
       reply({ action: "decline", reason: "rate limited — too many questions, try again later" });
       return;
     }

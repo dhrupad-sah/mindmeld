@@ -56,7 +56,7 @@ describe("team relay", () => {
       epoch: 0,
       invites: [],
       members: [
-        { login: alice.login, role: "admin", devices: [{ deviceId: alice.id.deviceId, signPub: alice.id.signPub, boxPub: alice.id.boxPub, hasKey: false }] },
+        { uid: alice.uid, login: alice.login, role: "admin", devices: [{ deviceId: alice.id.deviceId, signPub: alice.id.signPub, boxPub: alice.id.boxPub, hasKey: false }] },
       ],
     });
     expect(r.log.map((e: any) => [e.by, e.event, e.subject])).toEqual([[alice.login, "created", alice.login]]);
@@ -95,6 +95,7 @@ describe("team relay", () => {
     const r = await roster(bob, teamId);
     expect(r.invites).toEqual([]);
     expect(r.members.find((m: any) => m.login === bob.login)).toEqual({
+      uid: bob.uid,
       login: bob.login,
       role: "member",
       devices: [{ deviceId: bob.id.deviceId, signPub: bob.id.signPub, boxPub: bob.id.boxPub, hasKey: false }],
@@ -119,7 +120,7 @@ describe("team relay", () => {
   it("removing a member drops all their devices", async () => {
     const alice = await user("alice");
     const bob = await user("bob");
-    const bob2 = await signInTestUser(relay, bob.login);
+    const bob2 = await signInTestUser(relay, bob.login, bob.uid);
     const teamId = await createTeam(alice);
     await join(alice, teamId, bob);
     expect((await call(bob2, "POST", `/v1/teams/${teamId}/devices`)).status).toBe(200);
@@ -174,7 +175,7 @@ describe("team relay", () => {
     // Lower epoch: refused for anyone.
     expect((await put(alice, keysBody(alice.id, teamId, 1, k1, [alice.id, bob.id]))).status).toBe(409);
     // Same epoch: any member may add a wrap for a device that lacks one, but not overwrite one.
-    const bob2 = await signInTestUser(relay, bob.login);
+    const bob2 = await signInTestUser(relay, bob.login, bob.uid);
     expect((await call(bob2, "POST", `/v1/teams/${teamId}/devices`)).status).toBe(200);
     expect((await put(bob, keysBody(bob.id, teamId, 2, newTeamKey(), [bob.id], false))).status).toBe(409);
     const add = keysBody(bob.id, teamId, 2, k2, [bob2.id], false);
@@ -234,7 +235,7 @@ describe("team relay", () => {
     expect((await call(bob, "GET", `/v1/teams/${teamId}/keys`)).body).toEqual({ epoch: 0, wrapped: null, epochs: {} });
     // Same-epoch add with a wrap signed by someone other than the caller.
     expect((await put(alice, keysBody(alice.id, teamId, 1, k, [alice.id, bob.id]))).status).toBe(200);
-    const bob2 = await signInTestUser(relay, bob.login);
+    const bob2 = await signInTestUser(relay, bob.login, bob.uid);
     expect((await call(bob2, "POST", `/v1/teams/${teamId}/devices`)).status).toBe(200);
     expect((await put(bob, keysBody(alice.id, teamId, 1, k, [bob2.id], false))).status).toBe(400);
     expect((await call(bob2, "GET", `/v1/teams/${teamId}/keys`)).body.wrapped).toBeNull();
@@ -249,7 +250,7 @@ describe("team relay", () => {
     await join(alice, teamId, carol);
     const k = newTeamKey();
     expect((await call(alice, "PUT", `/v1/teams/${teamId}/keys`, keysBody(alice.id, teamId, 1, k, [alice.id, bob.id, carol.id]))).status).toBe(200);
-    const carol2 = await signInTestUser(relay, carol.login);
+    const carol2 = await signInTestUser(relay, carol.login, carol.uid);
     expect((await call(carol2, "POST", `/v1/teams/${teamId}/devices`)).status).toBe(200);
     expect((await call(bob, "PUT", `/v1/teams/${teamId}/keys`, keysBody(bob.id, teamId, 1, k, [carol2.id], false))).status).toBe(200);
     const { wrapped } = (await call(carol2, "GET", `/v1/teams/${teamId}/keys`)).body;
@@ -303,6 +304,56 @@ describe("team relay", () => {
     ]);
     for (const e of log) expect(typeof e.at).toBe("number");
     expect(log.map((e: any) => e.at)).toEqual([...log.map((e: any) => e.at)].sort((a, b) => a - b));
+  });
+
+  it("membership follows the GitHub numeric id, not the login", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const teamId = await createTeam(alice);
+    await join(alice, teamId, bob);
+    const before = await roster(alice, teamId);
+    expect(before.members.map((m: any) => [m.uid, m.login])).toEqual([[alice.uid, alice.login], [bob.uid, bob.login]]);
+
+    // Bob renames his GitHub account; someone else registers his old login.
+    const renamed = `${bob.login}-new`;
+    const squatter = await signInTestUser(relay, bob.login);
+    expect(squatter.uid).not.toBe(bob.uid);
+    expect((await call(squatter, "GET", `/v1/teams/${teamId}`)).status).toBe(403);
+    expect((await call(squatter, "GET", `/v1/teams/${teamId}/keys`)).status).toBe(403);
+    expect((await call(squatter, "POST", `/v1/teams/${teamId}/accept`)).status).toBe(403);
+    expect((await call(squatter, "GET", "/v1/teams")).body).toEqual([]);
+
+    // Bob signs in again under the new login: still a member, shown with the new login.
+    const bobAgain = await signInTestUser(relay, renamed, bob.uid);
+    expect(bobAgain.uid).toBe(bob.uid);
+    expect((await call(bobAgain, "GET", "/v1/teams")).body).toEqual([{ teamId, name: "core", role: "member" }]);
+    const after = await roster(alice, teamId);
+    expect(after.members.map((m: any) => [m.uid, m.login])).toEqual([[alice.uid, alice.login], [bob.uid, renamed]]);
+    // Admins still address members by their (current) login.
+    expect((await call(alice, "POST", `/v1/teams/${teamId}/roles`, { login: renamed, role: "admin" })).status).toBe(200);
+    expect((await call(alice, "POST", `/v1/teams/${teamId}/roles`, { login: bob.login, role: "member" })).status).toBe(404);
+  });
+
+  it("an invite is addressed by login and binds to the id that accepts it", async () => {
+    const alice = await user("alice");
+    const carol = await user("carol");
+    const teamId = await createTeam(alice);
+    expect((await call(alice, "POST", `/v1/teams/${teamId}/invites`, { login: carol.login })).status).toBe(200);
+    expect((await call(carol, "POST", `/v1/teams/${teamId}/accept`)).status).toBe(200);
+    const member = (await roster(alice, teamId)).members.find((m: any) => m.login === carol.login);
+    expect(member.uid).toBe(carol.uid);
+    // The invite is used up: a later account with carol's old login can't accept it again.
+    await signInTestUser(relay, `${carol.login}-x`, carol.uid);
+    const squatter = await signInTestUser(relay, carol.login);
+    expect((await call(squatter, "POST", `/v1/teams/${teamId}/accept`)).status).toBe(403);
+    expect((await call(squatter, "GET", "/v1/teams")).body).toEqual([]);
+  });
+
+  it("tokens carry the GitHub id", async () => {
+    const alice = await user("alice");
+    const me = await (await fetch(`${relay.url}/v1/me`, { headers: { authorization: `Bearer ${alice.token}` } })).json();
+    expect(me).toEqual({ uid: alice.uid, login: alice.login, deviceId: alice.id.deviceId });
+    expect(Number.isSafeInteger(alice.uid) && alice.uid > 0).toBe(true);
   });
 
   it("inputs are validated", async () => {

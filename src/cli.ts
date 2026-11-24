@@ -198,7 +198,7 @@ async function team(args: string[], yes: boolean): Promise<void> {
         if (invites.length) console.log(`Pending invites: ${invites.map((t) => `"${t.name}"`).join(", ")}`);
         return;
       }
-      console.log(formatTeam(await getRoster(relay, session, config.team.teamId), { login: session.login, deviceId: loadOrCreateIdentity().deviceId }));
+      console.log(formatTeam(await getRoster(relay, session, config.team.teamId), { uid: session.uid, deviceId: loadOrCreateIdentity().deviceId }));
       return;
     }
     case "create": {

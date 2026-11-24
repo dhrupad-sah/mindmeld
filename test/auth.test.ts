@@ -68,7 +68,8 @@ describe("sign-in", () => {
     expect(session.expiresAt).toBeGreaterThan(Date.now() / 1000 + 6 * 86400);
     const res = await me(session.token);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ login: "octocat", deviceId: id.deviceId });
+    expect(await res.json()).toEqual({ uid: session.uid, login: "octocat", deviceId: id.deviceId });
+    expect(Number.isSafeInteger(session.uid) && session.uid > 0).toBe(true);
     // Stored, mode 600, and loadable; the GitHub token is not kept.
     expect(loadSession(relay.url)).toEqual(session);
     const file = join(dir, "session.json");
@@ -87,26 +88,31 @@ describe("sign-in", () => {
 
   it("expired token is refused", async () => {
     const past = Math.floor(Date.now() / 1000) - 60;
-    expect((await me(forgeToken({ login: "octocat", deviceId: "0123456789abcdef", exp: past }))).status).toBe(401);
+    expect((await me(forgeToken({ uid: 7, login: "octocat", deviceId: "0123456789abcdef", exp: past }))).status).toBe(401);
     // Control: the same forge with a future exp is accepted, so the 401 above is about exp.
     const future = Math.floor(Date.now() / 1000) + 600;
-    expect((await me(forgeToken({ login: "octocat", deviceId: "0123456789abcdef", exp: future }))).status).toBe(200);
+    expect((await me(forgeToken({ uid: 7, login: "octocat", deviceId: "0123456789abcdef", exp: future }))).status).toBe(200);
   });
 
   it("tampered, wrongly signed or malformed tokens are refused", async () => {
     const future = Math.floor(Date.now() / 1000) + 600;
-    const good = forgeToken({ login: "octocat", deviceId: "0123456789abcdef", exp: future });
+    const good = forgeToken({ uid: 7, login: "octocat", deviceId: "0123456789abcdef", exp: future });
     const [body, sig] = good.split(".");
-    const otherBody = Buffer.from(JSON.stringify({ login: "mallory", deviceId: "0123456789abcdef", exp: future })).toString("base64url");
+    const otherBody = Buffer.from(JSON.stringify({ uid: 7, login: "mallory", deviceId: "0123456789abcdef", exp: future })).toString("base64url");
     for (const t of [
       `${otherBody}.${sig}`,
-      forgeToken({ login: "octocat", deviceId: "0123456789abcdef", exp: future }, "11".repeat(32)),
+      forgeToken({ uid: 7, login: "octocat", deviceId: "0123456789abcdef", exp: future }, "11".repeat(32)),
       body,
       `${body}.`,
       `${body}.${sig}.x`,
       "not a token",
-      forgeToken({ login: "octocat", deviceId: "xyz", exp: future }),
-      forgeToken({ login: "octocat", deviceId: "0123456789abcdef", exp: "soon" }),
+      forgeToken({ uid: 7, login: "octocat", deviceId: "xyz", exp: future }),
+      forgeToken({ uid: 7, login: "octocat", deviceId: "0123456789abcdef", exp: "soon" }),
+      // The GitHub id is required, and must be a positive integer.
+      forgeToken({ login: "octocat", deviceId: "0123456789abcdef", exp: future }),
+      forgeToken({ uid: "7", login: "octocat", deviceId: "0123456789abcdef", exp: future }),
+      forgeToken({ uid: 0, login: "octocat", deviceId: "0123456789abcdef", exp: future }),
+      forgeToken({ uid: 1.5, login: "octocat", deviceId: "0123456789abcdef", exp: future }),
     ]) {
       expect((await me(t)).status, t).toBe(401);
     }

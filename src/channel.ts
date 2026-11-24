@@ -12,6 +12,8 @@ export interface PayloadSender {
   cid?: string;
   /** Authenticated login. When present it is the sender's name; names claimed in payloads are ignored. */
   login?: string;
+  /** Authenticated GitHub numeric id (teams). When present, peer ownership binds to it rather than the login. */
+  uid?: number;
 }
 
 /**

@@ -10,6 +10,9 @@ import type { DeviceIdentity } from "../identity.js";
  * `relay` is the http(s) base of the relay that issued it: the token is only ever sent there.
  */
 export interface Session {
+  /** GitHub's numeric user id: the identity (logins can be renamed). */
+  uid: number;
+  /** Current GitHub login, for display. */
   login: string;
   token: string;
   expiresAt: number;
@@ -21,7 +24,7 @@ const sessionPath = () => join(homeDir(), "session.json");
 function isSession(v: unknown): v is Session {
   if (!v || typeof v !== "object") return false;
   const s = v as Record<string, unknown>;
-  return typeof s.login === "string" && typeof s.token === "string" && typeof s.expiresAt === "number" && typeof s.relay === "string";
+  return typeof s.uid === "number" && Number.isSafeInteger(s.uid) && s.uid > 0 && typeof s.login === "string" && typeof s.token === "string" && typeof s.expiresAt === "number" && typeof s.relay === "string";
 }
 
 function saveSession(s: Session): void {
@@ -72,8 +75,10 @@ export async function exchange(relayHttp: string, githubToken: string, id: Devic
     proof,
   });
   const b = body as Record<string, unknown> | null;
-  if (!b || typeof b.login !== "string" || typeof b.token !== "string" || typeof b.expiresAt !== "number") throw new Error("relay sign-in: unexpected response");
-  const session: Session = { login: b.login, token: b.token, expiresAt: b.expiresAt, relay: base };
+  if (!b || typeof b.uid !== "number" || !Number.isSafeInteger(b.uid) || b.uid <= 0 || typeof b.login !== "string" || typeof b.token !== "string" || typeof b.expiresAt !== "number") {
+    throw new Error("relay sign-in: unexpected response");
+  }
+  const session: Session = { uid: b.uid, login: b.login, token: b.token, expiresAt: b.expiresAt, relay: base };
   saveSession(session);
   return session;
 }
@@ -90,7 +95,7 @@ export function loadSession(relay: string): Session | null {
     return null;
   }
   if (!isSession(s) || s.expiresAt <= Date.now() / 1000 || !sameRelay(s.relay, relay)) return null;
-  return { login: s.login, token: s.token, expiresAt: s.expiresAt, relay: s.relay };
+  return { uid: s.uid, login: s.login, token: s.token, expiresAt: s.expiresAt, relay: s.relay };
 }
 
 /**

@@ -34,7 +34,7 @@ describe("team channel", () => {
 
   let n = 0;
   const user = (base: string) => signInTestUser(relay, `${base}${++n}`);
-  const session = (u: TestUser) => ({ login: u.login, token: u.token, expiresAt: Date.now() / 1000 + 3600, relay: relay.url });
+  const session = (u: TestUser) => ({ uid: u.uid, login: u.login, token: u.token, expiresAt: Date.now() / 1000 + 3600, relay: relay.url });
   const call = async (u: TestUser, method: string, path: string, body?: unknown) => {
     const res = await fetch(`${relay.url}${path}`, {
       method,
@@ -57,9 +57,9 @@ describe("team channel", () => {
   }
   function channel(u: TestUser, teamId: string, over: Partial<ConstructorParameters<typeof TeamChannel>[0]> = {}) {
     const ch = new TeamChannel({ relayHttp: relay.url, teamId, session: session(u), id: u.id, ...over });
-    const got: { p: Payload; login?: string; cid?: string }[] = [];
+    const got: { p: Payload; login?: string; uid?: number; cid?: string }[] = [];
     const closes: { code: number; reason: string }[] = [];
-    ch.on("payload", (p: Payload, from: { login?: string; cid?: string }) => got.push({ p, ...from }));
+    ch.on("payload", (p: Payload, from: { login?: string; uid?: number; cid?: string }) => got.push({ p, ...from }));
     ch.on("closed", (code: number, reason: string) => closes.push({ code, reason }));
     ch.start();
     cleanups.push(() => ch.stop());
@@ -121,21 +121,24 @@ describe("team channel", () => {
     expect(a.got.map((g) => [g.p.type === "hello" && g.p.name, g.login])).toEqual([["genuine", bob.login]]);
   }, 30_000);
 
-  it("drops a frame whose verified login differs from the relay's stamp or the connection's first sender", async () => {
+  it("drops a frame whose verified GitHub id differs from the relay's stamp or the connection's first sender", async () => {
     const alice = await user("alice");
     const bob = await user("bob");
     const { teamId, key } = await team(alice, [bob], [alice, bob]);
     const a = channel(alice, teamId);
     await waitFor(() => a.ch.connected && a.ch.status === null);
-    const inject = (f: TeamFrame, c: string, login: string) =>
-      (a.ch as unknown as { handleMessage(raw: string): void }).handleMessage(JSON.stringify({ t: "msg", f, c, login }));
+    const inject = (f: TeamFrame, c: string, u: TestUser, login = u.login) =>
+      (a.ch as unknown as { handleMessage(raw: string): void }).handleMessage(JSON.stringify({ t: "msg", f, c, uid: u.uid, login }));
     const fromBob = (name: string) => sealFrame(1, key, bob.id, JSON.stringify(hello(name)));
-    inject(fromBob("stamp-mismatch"), "c1", alice.login); // relay says alice, signature says bob
-    inject(fromBob("first"), "c2", bob.login); // binds c2 to bob
-    inject(sealFrame(1, key, alice.id, JSON.stringify(hello("rebind"))), "c2", alice.login); // c2 already bob's
-    inject(fromBob("again"), "c2", bob.login);
+    inject(fromBob("stamp-mismatch"), "c1", alice); // relay says alice, signature says bob
+    inject(fromBob("login-only"), "c3", alice, bob.login); // relay stamps bob's login but alice's id
+    inject(fromBob("first"), "c2", bob); // binds c2 to bob's id
+    inject(sealFrame(1, key, alice.id, JSON.stringify(hello("rebind"))), "c2", alice); // c2 already bob's
+    inject(fromBob("again"), "c2", bob);
     await sleep(50);
     expect(a.got.map((g) => g.p.type === "hello" && g.p.name)).toEqual(["first", "again"]);
+    // Delivered with the roster's login for display and the verified id.
+    expect(a.got[0]).toMatchObject({ login: bob.login, uid: bob.uid });
   }, 30_000);
 
   it("removed member cannot read frames after rotation", async () => {
@@ -163,7 +166,7 @@ describe("team channel", () => {
     await waitFor(() => c.msgs.some((m) => m.t === "msg"));
     const f = c.msgs.find((m) => m.t === "msg").f as TeamFrame;
     expect(f.e).toBe(2);
-    const roster = new Map([[alice.id.deviceId, { login: alice.login, signPub: alice.id.signPub }]]);
+    const roster = new Map([[alice.id.deviceId, { uid: alice.uid, login: alice.login, signPub: alice.id.signPub }]]);
     for (const k of bobKeys.keys.values()) expect(openFrame(f, new Map([[f.e, k]]), roster)).toBeNull();
     // Bob's channel does not come back.
     await sleep(2500);
@@ -202,7 +205,7 @@ describe("team channel", () => {
     expect(status).toBe(401);
   }, 30_000);
 
-  it("roster changes reach every socket and joined/left carry the login", async () => {
+  it("roster changes reach every socket and joined/left carry the id and login", async () => {
     const alice = await user("alice");
     const bob = await user("bob");
     const { teamId } = await team(alice, [bob], [alice, bob]);
@@ -212,12 +215,12 @@ describe("team channel", () => {
     const b = raw(bob, teamId);
     await waitFor(() => r.msgs.some((m) => m.t === "joined"));
     const joined = r.msgs.find((m) => m.t === "joined");
-    expect(joined).toEqual({ t: "joined", c: expect.any(String), login: bob.login });
+    expect(joined).toEqual({ t: "joined", c: expect.any(String), uid: bob.uid, login: bob.login });
     await call(alice, "POST", `/v1/teams/${teamId}/roles`, { login: bob.login, role: "admin" });
     await waitFor(() => r.msgs.some((m) => m.t === "roster") && b.msgs.some((m) => m.t === "roster"));
     b.ws.close();
     await waitFor(() => r.msgs.some((m) => m.t === "left"));
-    expect(r.msgs.find((m) => m.t === "left")).toEqual({ t: "left", c: joined.c, login: bob.login });
+    expect(r.msgs.find((m) => m.t === "left")).toEqual({ t: "left", c: joined.c, uid: bob.uid, login: bob.login });
   }, 30_000);
 
   it("daemons ask and answer over team channels, named by login", async () => {
@@ -283,7 +286,7 @@ describe("team channel", () => {
     const alice = await user("alice");
     const { teamId } = await team(alice, [], [alice]);
     const fetches = countFetches(teamId);
-    const a = channel(alice, teamId, { session: { login: alice.login, token: "not-a-token", expiresAt: Date.now() / 1000 + 3600, relay: relay.url } });
+    const a = channel(alice, teamId, { session: { uid: alice.uid, login: alice.login, token: "not-a-token", expiresAt: Date.now() / 1000 + 3600, relay: relay.url } });
     const expired: string[] = [];
     a.ch.on("auth-expired", (r: string) => expired.push(r));
     await waitFor(() => a.closes.length > 0);
@@ -301,7 +304,7 @@ describe("team channel", () => {
     const alice = await user("alice");
     const { teamId } = await team(alice, [], [alice]);
     const fetches = countFetches(teamId);
-    const a = channel(alice, teamId, { session: { login: alice.login, token: alice.token, expiresAt: Date.now() / 1000 - 1, relay: relay.url } });
+    const a = channel(alice, teamId, { session: { uid: alice.uid, login: alice.login, token: alice.token, expiresAt: Date.now() / 1000 - 1, relay: relay.url } });
     await waitFor(() => a.closes.length > 0);
     expect(a.ch.status).toBe(SIGN_IN_EXPIRED);
     await sleep(300);

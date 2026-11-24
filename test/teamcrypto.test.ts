@@ -21,8 +21,8 @@ function makeIdentity(): DeviceIdentity {
 const alice = makeIdentity();
 const bob = makeIdentity();
 const roster = new Map([
-  [alice.deviceId, { login: "alice", signPub: alice.signPub }],
-  [bob.deviceId, { login: "bob", signPub: bob.signPub }],
+  [alice.deviceId, { uid: 101, login: "alice", signPub: alice.signPub }],
+  [bob.deviceId, { uid: 102, login: "bob", signPub: bob.signPub }],
 ]);
 
 describe("teamcrypto", () => {
@@ -44,12 +44,12 @@ describe("teamcrypto", () => {
     expect(openFromDevice(bob, "")).toBeNull();
   });
 
-  it("frame round trip returns sender login", () => {
+  it("frame round trip returns the sender's id and login", () => {
     const teamKey = new Uint8Array(randomBytes(32));
     const f = sealFrame(3, teamKey, alice, '{"hello":"world"}');
     expect(f.e).toBe(3);
     expect(f.dev).toBe(alice.deviceId);
-    expect(openFrame(f, new Map([[3, teamKey]]), roster)).toEqual({ login: "alice", payload: '{"hello":"world"}' });
+    expect(openFrame(f, new Map([[3, teamKey]]), roster)).toEqual({ uid: 101, login: "alice", payload: '{"hello":"world"}' });
   });
 
   it("rejects forged sender", () => {
@@ -76,7 +76,7 @@ describe("teamcrypto", () => {
       // A roster entry under the odd id, and a frame correctly signed and sealed for it.
       const odd = { ...alice, deviceId: dev };
       const f = sealFrame(1, teamKey, odd, "hi");
-      const r = new Map([[dev, { login: "alice", signPub: alice.signPub }]]);
+      const r = new Map([[dev, { uid: 101, login: "alice", signPub: alice.signPub }]]);
       expect(openFrame(f, keys, r), dev).toBeNull();
     }
     // Control: the same construction with a well-formed id opens.
@@ -89,7 +89,7 @@ describe("teamcrypto", () => {
     // A = identity point, R = identity, S = 0 verifies for every message under ZIP-215, never under RFC 8032.
     const identity = "01" + "00".repeat(31);
     const universal = identity + "00".repeat(32);
-    const weak = new Map([[alice.deviceId, { login: "alice", signPub: identity }]]);
+    const weak = new Map([[alice.deviceId, { uid: 101, login: "alice", signPub: identity }]]);
     expect(openFrame({ ...f, sig: universal }, new Map([[1, teamKey]]), weak)).toBeNull();
   });
 

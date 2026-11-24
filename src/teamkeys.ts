@@ -16,6 +16,9 @@ export interface RosterDevice {
 
 /** One member of a team roster. */
 export interface RosterMember {
+  /** GitHub numeric user id: the member's identity. */
+  uid: number;
+  /** Current GitHub login, for display. */
   login: string;
   role: "admin" | "member";
   devices: RosterDevice[];
@@ -61,10 +64,10 @@ function verifySig(signPub: string, message: string, sig: string): boolean {
   }
 }
 
-/** Every device in the roster, keyed by deviceId, with its owner's login and role. */
-export function rosterDevices(roster: TeamRoster): Map<string, { login: string; signPub: string; role: "admin" | "member" }> {
-  const out = new Map<string, { login: string; signPub: string; role: "admin" | "member" }>();
-  for (const m of roster.members) for (const d of m.devices) out.set(d.deviceId, { login: m.login, signPub: d.signPub, role: m.role });
+/** Every device in the roster, keyed by deviceId, with its owner's uid, login and role. */
+export function rosterDevices(roster: TeamRoster): Map<string, { uid: number; login: string; signPub: string; role: "admin" | "member" }> {
+  const out = new Map<string, { uid: number; login: string; signPub: string; role: "admin" | "member" }>();
+  for (const m of roster.members) for (const d of m.devices) out.set(d.deviceId, { uid: m.uid, login: m.login, signPub: d.signPub, role: m.role });
   return out;
 }
 
@@ -205,7 +208,7 @@ async function putKeys(o: TeamKeyOptions, body: { epoch: number; wrapped: Record
 }
 
 const statusOf = (e: unknown) => (e as { status?: number })?.status;
-const roleOf = (roster: TeamRoster, login: string) => roster.members.find((m) => m.login === login.toLowerCase())?.role;
+const roleOf = (roster: TeamRoster, uid: number) => roster.members.find((m) => m.uid === uid)?.role;
 const allDevices = (roster: TeamRoster) => roster.members.flatMap((m) => m.devices);
 
 /** Seal `key` to each of `to`, signed by this device, as a PUT /keys `wrapped` map. */
@@ -229,7 +232,7 @@ export async function distributeKeys(
 ): Promise<{ result: "ok" | { waiting: string }; wrote: boolean }> {
   const waiting = { waiting: WAITING_FOR_KEY };
   if (roster.epoch === 0 && verified.epoch === 0) {
-    if (roleOf(roster, o.session.login) !== "admin") return { result: waiting, wrote: false };
+    if (roleOf(roster, o.session.uid) !== "admin") return { result: waiting, wrote: false };
     const key = newTeamKey();
     await putKeys(o, { epoch: 1, wrapped: wrapsFor(o, 1, key, allDevices(roster)), commit: epochCommit(o.id, o.teamId, 1, key) });
     return { result: "ok", wrote: true };
@@ -280,7 +283,7 @@ export async function ensureTeamKeys(opts: TeamKeyOptions): Promise<"ok" | { wai
 export async function rotate(opts: TeamKeyOptions & { reason: "removed" }): Promise<number> {
   for (let attempt = 0; ; attempt++) {
     const roster = await fetchRoster(opts.relayHttp, opts.teamId, opts.session);
-    if (roleOf(roster, opts.session.login) !== "admin") throw Object.assign(new Error("only admins rotate the team key"), { status: 403 });
+    if (roleOf(roster, opts.session.uid) !== "admin") throw Object.assign(new Error("only admins rotate the team key"), { status: 403 });
     const epoch = roster.epoch + 1;
     const key = newTeamKey();
     try {

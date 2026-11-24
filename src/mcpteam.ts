@@ -132,7 +132,7 @@ export function setupTeams(host: TeamHost) {
         }
       }
       if (channelExpired) signedIn = SIGNED_IN_EXPIRED;
-      teamText = teamLine(config.team.name, roster, "session" in s ? s.session.login : null) + failed;
+      teamText = teamLine(config.team.name, roster, "session" in s ? s.session.uid : null) + failed;
     }
     // The relay in use: the legacy group's when only a group is set, else the team relay.
     const relay = relayWarning(config?.secret && !config.team ? config.relay : relayUrl);
@@ -303,7 +303,7 @@ export function setupTeams(host: TeamHost) {
           return text(`This machine isn't using a team. Yours: ${teams.map(describeEntry).join(", ")}. Use accept_invite with the team's name to use one here.`);
         }
         const roster = await getRoster(r.relay, r.session, r.config.team.teamId);
-        return text(formatTeam(roster, { login: r.session.login, deviceId: loadOrCreateIdentity().deviceId }));
+        return text(formatTeam(roster, { uid: r.session.uid, deviceId: loadOrCreateIdentity().deviceId }));
       });
     },
   );

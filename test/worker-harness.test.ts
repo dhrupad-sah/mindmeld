@@ -16,13 +16,13 @@ describe("relay test harness (real Worker)", () => {
     expect(relay.wsUrl.startsWith("ws://")).toBe(true);
   });
 
-  it("github mock: 401 for unknown token, { login } for a known one", async () => {
+  it("github mock: 401 for unknown token, { login, id } for a known one", async () => {
     const bad = await fetch(`${relay.github.url}/user`, { headers: { authorization: "Bearer nope" } });
     expect(bad.status).toBe(401);
     const token = relay.github.addUser("octocat");
     const ok = await fetch(`${relay.github.url}/user`, { headers: { authorization: `Bearer ${token}` } });
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toEqual({ login: "octocat" });
+    expect(await ok.json()).toEqual({ login: "octocat", id: expect.any(Number) });
     expect((await fetch(`${relay.github.url}/user`)).status).toBe(401);
   });
 });

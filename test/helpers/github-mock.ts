@@ -16,8 +16,11 @@ export interface DeviceFlowScript {
 export interface GithubMock {
   /** http base URL, no trailing slash (what the Worker gets as GITHUB_API_BASE). */
   url: string;
-  /** Register a user; returns a fake token that GET /user accepts. */
-  addUser(login: string): string;
+  /**
+   * Register a user; returns a fake token that GET /user accepts. Each call gets a fresh numeric id,
+   * unless `id` is given: reusing an id with a new login is that account renamed.
+   */
+  addUser(login: string, id?: number): string;
   /** Script the device flow (POST /login/device/code and POST /login/oauth/access_token). */
   setDeviceFlow(script: DeviceFlowScript): void;
   /** Number of polls of POST /login/oauth/access_token since the last setDeviceFlow. */
@@ -26,7 +29,7 @@ export interface GithubMock {
 }
 
 interface State {
-  users: Map<string, string>;
+  users: Map<string, { login: string; id: number }>;
   device: DeviceFlowScript | null;
   deviceCode: string | null;
   polls: number;
@@ -43,9 +46,9 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 const routes: Record<string, Handler> = {
   "GET /user": (req, res, { users }) => {
     const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? "");
-    const login = m ? users.get(m[1]) : undefined;
-    if (!login) return json(res, 401, { message: "Bad credentials" });
-    json(res, 200, { login });
+    const user = m ? users.get(m[1]) : undefined;
+    if (!user) return json(res, 401, { message: "Bad credentials" });
+    json(res, 200, { login: user.login, id: user.id });
   },
   "POST /login/device/code": (_req, res, state, body) => {
     if (!state.device || !body.get("client_id")) return json(res, 200, { error: "unauthorized_client" });
@@ -73,6 +76,7 @@ const routes: Record<string, Handler> = {
 
 export async function startGithubMock(): Promise<GithubMock> {
   const state: State = { users: new Map(), device: null, deviceCode: null, polls: 0 };
+  let nextId = 1000;
   const sockets = new Set<import("node:net").Socket>();
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -92,9 +96,9 @@ export async function startGithubMock(): Promise<GithubMock> {
   const { port } = server.address() as AddressInfo;
   return {
     url: `http://127.0.0.1:${port}`,
-    addUser(login) {
+    addUser(login, id) {
       const token = `gho_test_${randomBytes(16).toString("hex")}`;
-      state.users.set(token, login);
+      state.users.set(token, { login, id: id ?? nextId++ });
       return token;
     },
     setDeviceFlow(script) {

@@ -70,14 +70,14 @@ export function sealFrame(epoch: number, teamKey: Uint8Array, id: DeviceIdentity
 /**
  * Verify then decrypt a team frame. `f.dev` must be exactly 16 lowercase hex (checked first). The sender is looked up in `roster` by `f.dev`; the Ed25519 signature over
  * utf8(e + "|" + dev + "|" + d) is checked (strict Ed25519, zip215: false) against that entry's signPub BEFORE decryption; then `d` is opened with
- * keys.get(e) and AAD "mindmeld/frame/v1|" + e + "|" + dev. Returns the roster login and payload, or null on any
+ * keys.get(e) and AAD "mindmeld/frame/v1|" + e + "|" + dev. Returns the roster uid, login and payload, or null on any
  * failure (unknown device, bad signature, unknown epoch, decrypt failure, malformed input); never throws.
  */
 export function openFrame(
   f: TeamFrame,
   keys: Map<number, Uint8Array>,
-  roster: Map<string, { login: string; signPub: string }>,
-): { login: string; payload: string } | null {
+  roster: Map<string, { uid: number; login: string; signPub: string }>,
+): { uid: number; login: string; payload: string } | null {
   try {
     if (!f || typeof f.dev !== "string" || !DEVICE_ID.test(f.dev)) return null;
     if (typeof f.e !== "number" || !Number.isSafeInteger(f.e) || typeof f.d !== "string" || typeof f.sig !== "string" || !SIG_HEX.test(f.sig)) return null;
@@ -87,7 +87,7 @@ export function openFrame(
     const key = keys.get(f.e);
     if (!key) return null;
     const payload = open(key, f.d, frameAad(f.e, f.dev));
-    return payload === null ? null : { login: sender.login, payload };
+    return payload === null ? null : { uid: sender.uid, login: sender.login, payload };
   } catch {
     return null;
   }
