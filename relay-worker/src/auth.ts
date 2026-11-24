@@ -44,6 +44,16 @@ export interface DeviceRecord {
   boxPub: string;
 }
 
+/** A login's standing in a team, as kept in its Users index. */
+export type TeamIndexRole = "admin" | "member" | "invited";
+
+/** One row of a login's team index (GET /v1/teams). */
+export interface TeamIndexEntry {
+  teamId: string;
+  name: string;
+  role: TeamIndexRole;
+}
+
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
@@ -250,6 +260,23 @@ export class Users extends DurableObject<AuthEnv> {
       "CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, sign_pub TEXT NOT NULL, box_pub TEXT NOT NULL, added_at INTEGER NOT NULL, last_seen INTEGER NOT NULL)",
     );
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+    // Index of this login's teams for GET /v1/teams. The Team Durable Object is the source of truth.
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS teams (team_id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL)");
+  }
+
+  /** Record this login's role in a team ("admin", "member" or "invited"), or drop the entry when role is null. */
+  setTeam(teamId: string, name: string, role: TeamIndexRole | null): void {
+    const sql = this.ctx.storage.sql;
+    if (role === null) sql.exec("DELETE FROM teams WHERE team_id = ?", teamId);
+    else sql.exec("INSERT INTO teams (team_id, name, role) VALUES (?, ?, ?) ON CONFLICT(team_id) DO UPDATE SET name = excluded.name, role = excluded.role", teamId, name, role);
+  }
+
+  /** This login's teams and invitations, as last recorded by the Team objects. */
+  teams(): TeamIndexEntry[] {
+    return this.ctx.storage.sql
+      .exec<{ team_id: string; name: string; role: string }>("SELECT team_id, name, role FROM teams ORDER BY rowid")
+      .toArray()
+      .map((r) => ({ teamId: r.team_id, name: r.name, role: r.role as TeamIndexRole }));
   }
 
   /** Record (or refresh) a device. False if that deviceId is already here with different keys. */
