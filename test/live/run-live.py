@@ -73,7 +73,7 @@ sleep 30
     else:
         body = f"""say "Use mindmeld to invite a teammate. My name is Dhrupad."
 set timeout 120
-expect -re {{(?:^|[^a-zA-Z0-9_/.-]|\x1b\[[\d;]*[A-Za-z])([a-z2-9]{{4}}-[a-z2-9]{{4}}-[a-z2-9]{{4}})(?![a-zA-Z0-9-])}} {{ set c $expect_out(1,string); exec sh -c "echo $c > {WORK}/code.txt"; ev invite-code-ok }} timeout {{ ev invite-FAILED }}
+expect -re {{(?:^|[^a-zA-Z0-9_/.-]|\\x1b\\[[\\d;]*[A-Za-z])([a-z2-9]{{4}}-[a-z2-9]{{4}}-[a-z2-9]{{4}})(?![a-zA-Z0-9-])}} {{ set c $expect_out(1,string); exec sh -c "echo $c > {WORK}/code.txt"; ev invite-code-ok }} timeout {{ ev invite-FAILED }}
 set w 0
 while {{![file exists {WORK}/joined] && $w < 420}} {{ sleep 1; incr w }}
 sleep 4
