@@ -10,6 +10,7 @@ import { Daemon, type AskState, type Decide, type Decision } from "./daemon.js";
 import { runInviter, runJoiner } from "./pairing.js";
 import { fenceUntrusted } from "./protocol.js";
 import { listSessions } from "./sessions.js";
+import { compareVersions, VERSION } from "./version.js";
 
 const APPROVAL_TIMEOUT_MS = 10 * 60_000;
 const NOT_PAIRED =
@@ -66,7 +67,7 @@ function ago(ms: number): string {
  * dialogs in that session and answered by a read-only fork of it.
  */
 export async function runMcpServer(): Promise<void> {
-  const server = new McpServer({ name: "mindmeld", version: "0.4.2" });
+  const server = new McpServer({ name: "mindmeld", version: VERSION });
   const cwd = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const mySessionId = process.env.CLAUDE_CODE_SESSION_ID;
   let daemon: Daemon | null = null;
@@ -166,6 +167,32 @@ export async function runMcpServer(): Promise<void> {
     share = null;
   }
 
+  const UPDATE = "claude plugin update mindmeld@mindmeld, then restart Claude Code";
+
+  /** Things the user should know about versions: shown in status, and once per session elsewhere. */
+  function notices(): string[] {
+    const info = daemon?.server;
+    if (!info) return [];
+    if (info.blocked) return [`mindmeld ${VERSION} is no longer supported by the relay (minimum ${info.minimum}). Update: ${UPDATE}.`];
+    const out: string[] = [];
+    if (compareVersions(VERSION, info.latest) < 0) out.push(`mindmeld ${info.latest} is available (you have ${VERSION}). Update: ${UPDATE}.`);
+    if (info.legacy) {
+      out.push(
+        `${info.legacy} teammate session${info.legacy === 1 ? " is" : "s are"} on an old mindmeld and can't see or ask this one. They need to update: ${UPDATE}.`,
+      );
+    }
+    return out;
+  }
+
+  let noticeShown = false;
+  /** Append version notices to a tool result the first time they apply in this session. */
+  const withNotices = (r: ReturnType<typeof text>) => {
+    const n = notices();
+    if (noticeShown || n.length === 0) return r;
+    noticeShown = true;
+    return { ...r, content: [...r.content, { type: "text" as const, text: n.join("\n") }] };
+  };
+
   const existing = loadConfigOrNull();
   if (existing) connect(existing);
 
@@ -192,8 +219,8 @@ export async function runMcpServer(): Promise<void> {
     async () => {
       if (!daemon) return text(NOT_PAIRED);
       const peers = daemon.onlinePeers();
-      if (peers.length === 0) return text("Nobody is sharing a session right now. Teammates appear here after they run /mindmeld:share.");
-      return text(peers.map((p) => `- ${p.name}: "${p.project}"${p.activeAt ? ` · active ${ago(p.activeAt)}` : ""}`).join("\n"));
+      if (peers.length === 0) return withNotices(text("Nobody is sharing a session right now. Teammates appear here after they run /mindmeld:share."));
+      return withNotices(text(peers.map((p) => `- ${p.name}: "${p.project}"${p.activeAt ? ` · active ${ago(p.activeAt)}` : ""}`).join("\n")));
     },
   );
 
@@ -225,8 +252,8 @@ export async function runMcpServer(): Promise<void> {
       progress("sending");
       const r = await daemon.ask(question, { peer, context, timeoutSec: timeout_sec, onStatus: (s) => progress(STATE_TEXT[s]) });
       logActivity({ at: Date.now(), dir: "out", peer: "error" in r ? (peer ?? "?") : r.from, question: question.slice(0, 200), outcome: "error" in r ? r.error : "answered" });
-      if ("error" in r) return text(`No answer: ${r.error}`, true);
-      return text(fenceUntrusted(r.from, r.text));
+      if ("error" in r) return withNotices(text(`No answer: ${r.error}`, true));
+      return withNotices(text(fenceUntrusted(r.from, r.text)));
     },
   );
 
@@ -316,7 +343,9 @@ export async function runMcpServer(): Promise<void> {
       if (!c || !daemon) return text(NOT_PAIRED);
       const peers = daemon.onlinePeers();
       const lines = [
-        `Connection: ${daemon.connected ? "connected" : "NOT connected (reconnecting to the relay)"}`,
+        `Connection: ${daemon.server?.blocked ? "blocked: this version is too old" : daemon.connected ? "connected" : "NOT connected (reconnecting to the relay)"}`,
+        `Version: ${VERSION}`,
+        ...notices(),
         `You appear as: ${c.name}`,
         `This session: ${share ? `shared as "${share.label}"` : "private (not visible to anyone). Run /mindmeld:share to share it."}`,
         `Sharing now: ${peers.length ? peers.map((p) => `${p.name} ("${p.project}")`).join(", ") : "nobody"}`,

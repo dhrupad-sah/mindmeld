@@ -44,13 +44,36 @@ export const Payload = z.discriminatedUnion("type", [
 ]);
 export type Payload = z.infer<typeof Payload>;
 
-/** Relay envelope: opaque sealed data. */
-export const Frame = z.object({ t: z.literal("msg"), d: z.string() });
+/** Relay envelope: opaque sealed data. From v3 the relay adds `c`, the sender's connection id. */
+export const Frame = z.object({ t: z.literal("msg"), d: z.string(), c: z.string().optional() });
 export type Frame = z.infer<typeof Frame>;
 
-export const PROTOCOL_VERSION = 2;
-export const HELLO_INTERVAL_MS = 20_000;
-export const PEER_TIMEOUT_MS = 60_000;
+/**
+ * Plaintext control frames from the relay (v3+ clients only, i.e. those that send `?v=`):
+ * - server: versions, sent on connect (and when the count of old clients in the room changes).
+ *   `blocked` means this client is below the minimum and is about to be disconnected.
+ * - joined / left: a connection opened or closed. Presence is driven by these instead of timers.
+ */
+export const Control = z.discriminatedUnion("t", [
+  z.object({
+    t: z.literal("server"),
+    latest: z.string(),
+    minimum: z.string(),
+    legacy: z.number().optional(),
+    blocked: z.boolean().optional(),
+  }),
+  z.object({ t: z.literal("joined"), c: z.string() }),
+  z.object({ t: z.literal("left"), c: z.string() }),
+]);
+export type Control = z.infer<typeof Control>;
+
+export const PROTOCOL_VERSION = 3;
+/** How often a client checks whether its "last active" time moved enough to re-announce. */
+export const ACTIVITY_CHECK_MS = 60_000;
+/** Re-announce "last active" only when it moved by at least this much. */
+export const ACTIVITY_RESOLUTION_MS = 5 * 60_000;
+/** WebSocket protocol pings (not billed by Cloudflare) to detect dead connections. */
+export const PING_INTERVAL_MS = 60_000;
 
 /** Fence peer-originated text so the asking Claude treats it as data, not instructions. */
 export function fenceUntrusted(from: string, text: string): string {

@@ -29,9 +29,8 @@ keyboard. Otherwise it fails after 15 s. Slack beats that.
   `/mindmeld:inbox`, and `status` shows the count of new answers.
 - The relay stores only ciphertext addressed to a member id, with no question text.
 
-**Decision needed:** when an away person returns, should the question go to *any* session they
-open, or only to a session shared under the label the asker picked? Recommendation: offer it in
-whichever session they share first, and show the label the asker picked.
+**Decided:** a waiting question is delivered only to a session shared under the label the asker
+picked. Until one exists, it waits (7-day expiry), and the asker's status says what it's waiting for.
 
 **Risks:** stale context (they answer days later from a session that has moved on). Mitigation:
 the dialog shows when the question was asked.
@@ -236,10 +235,11 @@ command.
 That's about 4–5 weeks of focused work. Protocol v3 (identity) won't be compatible with 0.4
 clients. The `minimum` version from item 4 handles the cutover with a clear message.
 
-## Open decisions
+## Decisions (2026-11-24)
 
-1. **Login:** GitHub (fastest, matches teammate-sync) or the company's SSO?
-2. **Relay hosting for the pilot:** the company's Cloudflare account, or keep mine for now?
-3. **Away questions:** any session they open, or only a shared one with the asker's label?
-4. **Security review:** who reviews the crypto before a company pilot: internal security, or an
-   outside reviewer?
+1. **Login:** GitHub (device flow).
+2. **Relay hosting for the pilot:** stays on Dhrupad's Cloudflare account for now.
+3. **Away questions:** delivered only to a session shared under the label the asker picked. If
+   no session with that label is shared, the question waits, and the asker's status shows
+   "waiting for Sarim to share 'scraper work'".
+4. **Crypto review:** deferred. It must happen before any company pilot relies on mindmeld.

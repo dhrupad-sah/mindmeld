@@ -1,4 +1,7 @@
 import type { Server } from "node:http";
+import { mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { answerWithFork } from "../src/answerer.js";
@@ -182,32 +185,44 @@ describe("end to end", () => {
 });
 
 describe("answerWithFork", () => {
-  const stub = fileURLToPath(new URL("./stub-claude.mjs", import.meta.url));
+  const stubScript = fileURLToPath(new URL("./stub-claude.mjs", import.meta.url));
+  // Windows can't run a .mjs directly; go through a .cmd wrapper, like an npm-installed claude.
+  const stub =
+    process.platform === "win32"
+      ? (() => {
+          const cmd = join(mkdtempSync(join(tmpdir(), "stub-")), "claude.cmd");
+          writeFileSync(cmd, `@node "${stubScript}" %*\r\n`);
+          return cmd;
+        })()
+      : stubScript;
 
   it("runs a read-only forked continue with the question on stdin", async () => {
     process.env.CLAUDE_SHARE_CLAUDE_BIN = stub;
-    const out = JSON.parse(await answerWithFork({ cwd: "/tmp", from: "alice", question: "how?", context: "ctx" }));
+    const out = JSON.parse(await answerWithFork({ cwd: tmpdir(), from: "alice", question: "how?", context: "ctx" }));
     expect(out.args.slice(0, 3)).toEqual(["-p", "--continue", "--fork-session"]);
     expect(out.args).toEqual(expect.arrayContaining(["--permission-mode", "dontAsk", "--setting-sources", "", "--allowedTools", "Read(./**)", "Glob(./**)"]));
     expect(out.args).toEqual(expect.arrayContaining(["Read(./**/.env)", "Read(./**/*.pem)", "Bash", "Grep", "Edit", "Write"]));
     expect(out.args).not.toContain("Read");
-    expect(out.args).toEqual(expect.arrayContaining(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']));
+    const cfg = out.args[out.args.indexOf("--mcp-config") + 1];
+    expect(out.args).toContain("--strict-mcp-config");
+    expect(JSON.parse(readFileSync(cfg, "utf8"))).toEqual({ mcpServers: {} });
+    expect(out.args.find((a: string) => a.startsWith("A teammate's"))).not.toMatch(/\n/);
     expect(out.args).toEqual(expect.arrayContaining(["--no-session-persistence", "--no-chrome"]));
     expect(out.input).toContain('Question from teammate "alice":\nhow?');
     expect(out.input).toContain("ctx");
-    expect(out.cwd).toMatch(/tmp$/);
+    expect(realpathSync(out.cwd)).toBe(realpathSync(tmpdir()));
   });
 
   it("resumes a specific session when given one", async () => {
     process.env.CLAUDE_SHARE_CLAUDE_BIN = stub;
     const id = "11111111-1111-4111-8111-111111111111";
-    const out = JSON.parse(await answerWithFork({ cwd: "/tmp", from: "a", question: "q", sessionId: id }));
+    const out = JSON.parse(await answerWithFork({ cwd: tmpdir(), from: "a", question: "q", sessionId: id }));
     expect(out.args.slice(0, 4)).toEqual(["-p", "--resume", id, "--fork-session"]);
     expect(out.args).not.toContain("--continue");
   });
 
   it("rejects when claude fails", async () => {
     process.env.CLAUDE_SHARE_CLAUDE_BIN = stub;
-    await expect(answerWithFork({ cwd: "/tmp", from: "a", question: "FAIL" })).rejects.toThrow(/exited with 2: boom/);
+    await expect(answerWithFork({ cwd: tmpdir(), from: "a", question: "FAIL" })).rejects.toThrow(/exited with 2: boom/);
   });
 });
