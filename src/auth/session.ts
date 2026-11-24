@@ -1,5 +1,7 @@
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { homeDir } from "../config.js";
 import type { DeviceIdentity } from "../identity.js";
 
@@ -25,16 +27,14 @@ function saveSession(s: Session): void {
   chmodSync(path, 0o600);
 }
 
-/**
- * Trade a GitHub token for a mindmeld session at the relay (`relayHttp` is its http(s) base URL),
- * registering this device's public keys. Saves the session to `session.json` (mode 600). The GitHub
- * token itself is not stored.
- */
-export async function exchange(relayHttp: string, githubToken: string, id: DeviceIdentity): Promise<Session> {
-  const res = await fetch(`${relayHttp.replace(/\/+$/, "")}/v1/auth/github`, {
+/** Domain prefix for the device's sign-in proof; nothing else is signed under it. */
+const AUTH_PROOF_DOMAIN = "mm-auth|v1|";
+
+async function postJson(url: string, payload?: unknown): Promise<unknown> {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ githubToken, device: { deviceId: id.deviceId, signPub: id.signPub, boxPub: id.boxPub } }),
+    body: payload === undefined ? undefined : JSON.stringify(payload),
   });
   let body: unknown;
   try {
@@ -46,6 +46,27 @@ export async function exchange(relayHttp: string, githubToken: string, id: Devic
     const msg = body && typeof (body as { error?: unknown }).error === "string" ? (body as { error: string }).error : `HTTP ${res.status}`;
     throw new Error(`relay refused sign-in: ${msg}`);
   }
+  return body;
+}
+
+/**
+ * Trade a GitHub token for a mindmeld session at the relay (`relayHttp` is its base URL; ws(s)://
+ * is mapped to http(s)://). Proves possession of the device key by signing the relay's challenge
+ * as utf8("mm-auth|v1|" + nonce + "|" + deviceId), and registers this device's public keys.
+ * Saves the session to `session.json` (mode 600). The GitHub token itself is not stored.
+ */
+export async function exchange(relayHttp: string, githubToken: string, id: DeviceIdentity): Promise<Session> {
+  const base = relayHttp.replace(/^ws(s?):\/\//, "http$1://").replace(/\/+$/, "");
+  const ch = await postJson(`${base}/v1/auth/challenge`);
+  const nonce = (ch as { nonce?: unknown } | null)?.nonce;
+  if (typeof nonce !== "string" || !/^[0-9a-f]+$/.test(nonce)) throw new Error("relay sign-in: unexpected challenge response");
+  const proof = bytesToHex(ed25519.sign(new TextEncoder().encode(`${AUTH_PROOF_DOMAIN}${nonce}|${id.deviceId}`), hexToBytes(id.signPriv)));
+  const body = await postJson(`${base}/v1/auth/github`, {
+    githubToken,
+    device: { deviceId: id.deviceId, signPub: id.signPub, boxPub: id.boxPub },
+    nonce,
+    proof,
+  });
   if (!isSession(body)) throw new Error("relay sign-in: unexpected response");
   const session: Session = { login: body.login, token: body.token, expiresAt: body.expiresAt };
   saveSession(session);

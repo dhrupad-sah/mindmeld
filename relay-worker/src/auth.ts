@@ -1,8 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
+import { ed25519 } from "@noble/curves/ed25519.js";
 
 /**
  * GitHub sign-in for the relay.
- * - POST /v1/auth/github { githubToken, device: { deviceId, signPub, boxPub } } checks the GitHub
+ * - POST /v1/auth/challenge returns { nonce, expiresAt }: a stateless, relay-MACed nonce, valid 5 min.
+ * - POST /v1/auth/github { githubToken, device: { deviceId, signPub, boxPub }, nonce, proof } first
+ *   checks the nonce and that `proof` is an Ed25519 signature by signPub over
+ *   utf8("mm-auth|v1|" + nonce + "|" + deviceId) (proof of possession), then checks the GitHub
  *   token against `${GITHUB_API_BASE}/user`, records the device under that login (Users Durable
  *   Object, one per login) and returns { login, token, expiresAt }. The GitHub token is used once
  *   and never stored.
@@ -25,6 +29,14 @@ const HEX64 = /^[0-9a-f]{64}$/;
 /** GitHub's login rules: alphanumerics and single hyphens, up to 39 chars. */
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
 const MAX_BODY_BYTES = 16 * 1024;
+/** Challenge lifetime, seconds. */
+export const CHALLENGE_TTL_SECONDS = 5 * 60;
+/** Domain prefixes: the relay's nonce MAC and the device's proof signature each own one. */
+const CHALLENGE_DOMAIN = "mm-challenge|v1|";
+const AUTH_PROOF_DOMAIN = "mm-auth|v1|";
+/** nonce = hex(random 32 bytes) + hex(exp, 8 bytes big-endian) + hex(HMAC 32 bytes). */
+const NONCE = /^[0-9a-f]{144}$/;
+const HEX128 = /^[0-9a-f]{128}$/;
 
 export interface DeviceRecord {
   deviceId: string;
@@ -64,6 +76,43 @@ async function signingKey(env: AuthEnv): Promise<CryptoKey> {
   // Fail closed: no key, or a short one, means no tokens at all.
   if (!/^(?:[0-9a-fA-F]{2}){32,}$/.test(hex)) throw new Error("TOKEN_SIGNING_KEY missing or shorter than 32 bytes");
   return crypto.subtle.importKey("raw", hexToBytes(hex.toLowerCase()), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+}
+
+const toHex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+
+async function challengeMac(randHex: string, expHex: string, env: AuthEnv): Promise<Uint8Array> {
+  const msg = new TextEncoder().encode(`${CHALLENGE_DOMAIN}${randHex}|${expHex}`);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", await signingKey(env), msg));
+}
+
+/** Mint a sign-in challenge. Stateless: the relay recognises it later by its MAC. */
+export async function issueChallenge(env: AuthEnv): Promise<{ nonce: string; expiresAt: number }> {
+  const exp = Math.floor(Date.now() / 1000) + CHALLENGE_TTL_SECONDS;
+  const randHex = toHex(crypto.getRandomValues(new Uint8Array(32)));
+  const expHex = exp.toString(16).padStart(16, "0");
+  return { nonce: randHex + expHex + toHex(await challengeMac(randHex, expHex, env)), expiresAt: exp };
+}
+
+/** True if `nonce` was minted by this relay (constant-time MAC check) and has not expired. */
+export async function verifyChallenge(nonce: string, env: AuthEnv): Promise<boolean> {
+  if (typeof nonce !== "string" || !NONCE.test(nonce)) return false;
+  const randHex = nonce.slice(0, 64);
+  const expHex = nonce.slice(64, 80);
+  const msg = new TextEncoder().encode(`${CHALLENGE_DOMAIN}${randHex}|${expHex}`);
+  const ok = await crypto.subtle.verify("HMAC", await signingKey(env), hexToBytes(nonce.slice(80)), msg);
+  if (!ok) return false;
+  const exp = parseInt(expHex, 16);
+  return Number.isSafeInteger(exp) && exp > Math.floor(Date.now() / 1000);
+}
+
+/** Strict Ed25519 (zip215: false) check of the device's proof over its own domain-prefixed message. */
+function verifyDeviceProof(dev: DeviceRecord, nonce: string, proof: string): boolean {
+  try {
+    const msg = new TextEncoder().encode(`${AUTH_PROOF_DOMAIN}${nonce}|${dev.deviceId}`);
+    return ed25519.verify(hexToBytes(proof), msg, hexToBytes(dev.signPub), { zip215: false });
+  } catch {
+    return false;
+  }
 }
 
 /** Issue a session token for `login` on `deviceId`, valid TOKEN_TTL_SECONDS. */
@@ -153,12 +202,18 @@ async function readJsonBody(req: Request): Promise<unknown> {
 async function signIn(req: Request, env: AuthEnv): Promise<Response> {
   const body = await readJsonBody(req);
   if (!body || typeof body !== "object") return json(400, { error: "bad request" });
-  const { githubToken, device } = body as Record<string, unknown>;
+  const { githubToken, device, nonce, proof } = body as Record<string, unknown>;
   if (typeof githubToken !== "string" || !githubToken || githubToken.length > 255 || /\s/.test(githubToken)) {
     return json(400, { error: "bad request" });
   }
   const dev = await parseDevice(device);
   if (!dev) return json(400, { error: "bad device" });
+  if (typeof nonce !== "string" || !NONCE.test(nonce) || typeof proof !== "string" || !HEX128.test(proof)) {
+    return json(400, { error: "missing or malformed challenge proof" });
+  }
+  // Proof of possession before anything is recorded or GitHub is even asked.
+  if (!(await verifyChallenge(nonce, env))) return json(401, { error: "challenge expired or invalid" });
+  if (!verifyDeviceProof(dev, nonce, proof)) return json(401, { error: "device proof failed" });
   const login = await githubLogin(githubToken, env);
   if (login === "denied") return json(401, { error: "github sign-in failed" });
   if (login === "error") return json(502, { error: "github unavailable" });
@@ -179,6 +234,9 @@ async function whoami(req: Request, env: AuthEnv): Promise<Response> {
 
 /** Handle /v1/auth/* and /v1/me; null for any other path. */
 export async function handleAuth(req: Request, env: AuthEnv, pathname: string): Promise<Response | null> {
+  if (pathname === "/v1/auth/challenge") {
+    return req.method === "POST" ? json(200, await issueChallenge(env)) : json(405, { error: "method not allowed" });
+  }
   if (pathname === "/v1/auth/github") return req.method === "POST" ? signIn(req, env) : json(405, { error: "method not allowed" });
   if (pathname === "/v1/me") return req.method === "GET" ? whoami(req, env) : json(405, { error: "method not allowed" });
   return null;
