@@ -31,6 +31,15 @@ describe("crypto", () => {
     expect(open(key, buf.toString("base64"))).toBeNull();
     expect(open(key, "garbage")).toBeNull();
   });
+
+  it("binds optional AAD", () => {
+    const key = keyFor(generateGroupSecret());
+    const sealed = seal(key, "hello", "ctx-a");
+    expect(open(key, sealed, "ctx-a")).toBe("hello");
+    expect(open(key, sealed, "ctx-b")).toBeNull();
+    expect(open(key, sealed)).toBeNull();
+    expect(open(key, seal(key, "hello"), "ctx-a")).toBeNull();
+  });
 });
 
 describe("spake2", () => {
