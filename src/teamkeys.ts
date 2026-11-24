@@ -75,8 +75,10 @@ function checkWrap(teamId: string, id: DeviceIdentity, devices: ReturnType<typeo
   if (!verifySig(writer.signPub, `mm-wrap|v1|${teamId}|${epoch}|${id.deviceId}|${w.sealed}`, w.sig)) return "bad wrap signature";
   const c = w.commit;
   if (!c || typeof c.hash !== "string" || typeof c.by !== "string" || typeof c.sig !== "string" || !HEX64.test(c.hash)) return "no epoch commit";
-  const committer = devices.get(c.by);
-  if (!committer || committer.role !== "admin") return "commit not by a current admin device";
+  // Any current roster device: the relay only accepts a rotation from an admin, and checking the role
+  // now would break every epoch committed by an admin who has since been demoted.
+  const committer = HEX16.test(c.by) ? devices.get(c.by) : undefined;
+  if (!committer) return "commit signed by a device not in the team";
   if (!verifySig(committer.signPub, `mm-epoch|v1|${teamId}|${epoch}|${c.hash}`, c.sig)) return "bad commit signature";
   const key = openFromDevice(id, w.sealed);
   if (!key || key.length !== 32) return "cannot unwrap the key for this device";
@@ -88,7 +90,7 @@ function checkWrap(teamId: string, id: DeviceIdentity, devices: ReturnType<typeo
  * Verify the wrapped keys from GET /v1/teams/:id/keys against `roster`. For each epoch: the wrap's
  * signature (utf8 "mm-wrap|v1|teamId|epoch|myDeviceId|sealed") must be by its writer `by`, a current
  * member device; the commit signature (utf8 "mm-epoch|v1|teamId|epoch|hash") must be by a current
- * admin device; the key must unwrap with this device's box key and hash (hex sha256) to commit.hash.
+ * roster device (any role; the relay enforces admin-only rotation when it is written); the key must unwrap with this device's box key and hash (hex sha256) to commit.hash.
  * Epochs failing any check are dropped and listed in `problems`. Never throws.
  */
 export function verifyTeamKeys(

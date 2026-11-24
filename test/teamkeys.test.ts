@@ -58,7 +58,7 @@ describe("verifyTeamKeys", () => {
     const k = newTeamKey();
     const badWrapSig = { ...entry(1, k), sig: entry(1, newTeamKey()).sig };
     const byOutsider = entry(2, k, outsider);
-    const commitByMember = entry(3, k, admin, member);
+    const commitByOutsider = entry(3, k, admin, outsider);
     const badCommitSig = (() => {
       const e = entry(4, k);
       return { ...e, commit: { ...e.commit!, sig: entry(5, k).commit!.sig } };
@@ -75,13 +75,21 @@ describe("verifyTeamKeys", () => {
     const replayedEpoch = { ...entry(8, k), sig: entry(9, k).sig };
     const out = verifyTeamKeys(TEAM, me, { ...roster, epoch: 9 }, {
       epoch: 9,
-      epochs: { 1: badWrapSig, 2: byOutsider, 3: commitByMember, 4: badCommitSig, 5: hashMismatch, 6: noCommit, 7: notForMe, 8: replayedEpoch, 9: entry(9, k) },
+      epochs: { 1: badWrapSig, 2: byOutsider, 3: commitByOutsider, 4: badCommitSig, 5: hashMismatch, 6: noCommit, 7: notForMe, 8: replayedEpoch, 9: entry(9, k) },
     });
     expect([...out.keys.keys()]).toEqual([9]);
     expect(out.problems).toHaveLength(8);
-    for (const [i, why] of ["signature", "not in the team", "admin", "signature", "hash", "commit", "unwrap", "signature"].entries()) {
+    for (const [i, why] of ["signature", "not in the team", "commit signed by a device not in the team", "signature", "hash", "commit", "unwrap", "signature"].entries()) {
       expect(out.problems[i]).toMatch(new RegExp(`^team key for epoch ${i + 1} failed verification \\(.*${why}`));
     }
+  });
+
+  it("keeps an epoch committed by an admin who has since been demoted", () => {
+    const k = newTeamKey();
+    const demoted: TeamRoster = { ...roster, members: roster.members.map((m) => ({ ...m, role: "member" as const })) };
+    const out = verifyTeamKeys(TEAM, me, demoted, { epoch: 1, epochs: { 1: entry(1, k) } });
+    expect(out.problems).toEqual([]);
+    expect(out.keys).toEqual(new Map([[1, k]]));
   });
 
   it("rejects a wrap signed for another team", () => {

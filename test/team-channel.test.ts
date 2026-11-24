@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { Daemon } from "../src/daemon.js";
 import type { Payload } from "../src/protocol.js";
 import { openFrame, sealFrame, type TeamFrame } from "../src/teamcrypto.js";
-import { TeamChannel } from "../src/teamchannel.js";
+import { backoffDelay, SIGN_IN_EXPIRED, TeamChannel } from "../src/teamchannel.js";
 import { fetchRoster, fetchTeamKeys } from "../src/teamkeys.js";
 import { signInTestUser, type TestUser } from "./helpers/signin.js";
 import { keysBody, newTeamKey } from "./helpers/teamkeys.js";
@@ -55,8 +55,8 @@ describe("team channel", () => {
     await call(admin, "PUT", `/v1/teams/${teamId}/keys`, keysBody(admin.id, teamId, 1, key, keyed.map((u) => u.id)));
     return { teamId: teamId as string, key };
   }
-  function channel(u: TestUser, teamId: string) {
-    const ch = new TeamChannel({ relayHttp: relay.url, teamId, session: session(u), id: u.id });
+  function channel(u: TestUser, teamId: string, over: Partial<ConstructorParameters<typeof TeamChannel>[0]> = {}) {
+    const ch = new TeamChannel({ relayHttp: relay.url, teamId, session: session(u), id: u.id, ...over });
     const got: { p: Payload; login?: string; cid?: string }[] = [];
     const closes: { code: number; reason: string }[] = [];
     ch.on("payload", (p: Payload, from: { login?: string; cid?: string }) => got.push({ p, ...from }));
@@ -249,4 +249,91 @@ describe("team channel", () => {
     expect(asked).toEqual([alice.login]);
     expect(a.framesSent).toBeGreaterThan(0);
   }, 30_000);
+
+  it("demoting the admin who rotated keeps the team working", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const carol = await user("carol");
+    const { teamId } = await team(alice, [bob, carol], [alice, bob, carol]); // epoch 1 committed by alice
+    await call(alice, "POST", `/v1/teams/${teamId}/roles`, { login: bob.login, role: "admin" });
+    await call(bob, "POST", `/v1/teams/${teamId}/roles`, { login: alice.login, role: "member" });
+    const a = channel(alice, teamId);
+    const c = channel(carol, teamId);
+    await waitFor(() => a.ch.connected && c.ch.connected);
+    expect(c.ch.status).toBeNull();
+    expect(c.ch.epoch).toBe(1);
+    a.ch.send(hello("alice"));
+    await waitFor(() => c.got.length === 1);
+    expect(c.got[0].login).toBe(alice.login);
+  }, 30_000);
+
+  /** Count fetches to this team's routes from now on. */
+  function countFetches(teamId: string) {
+    const real = globalThis.fetch;
+    let n = 0;
+    globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (String(input instanceof Request ? input.url : input).includes(teamId)) n++;
+      return real(input, init);
+    }) as typeof fetch;
+    cleanups.push(() => (globalThis.fetch = real));
+    return () => n;
+  }
+
+  it("a 401 from the relay stops retrying and says sign-in expired", async () => {
+    const alice = await user("alice");
+    const { teamId } = await team(alice, [], [alice]);
+    const fetches = countFetches(teamId);
+    const a = channel(alice, teamId, { session: { login: alice.login, token: "not-a-token", expiresAt: Date.now() / 1000 + 3600 } });
+    const expired: string[] = [];
+    a.ch.on("auth-expired", (r: string) => expired.push(r));
+    await waitFor(() => a.closes.length > 0);
+    expect(a.closes).toEqual([{ code: 4401, reason: SIGN_IN_EXPIRED }]);
+    expect(a.ch.status).toBe(SIGN_IN_EXPIRED);
+    expect(expired).toEqual([SIGN_IN_EXPIRED]);
+    const after = fetches();
+    expect(after).toBe(1);
+    await sleep(3000);
+    expect(fetches()).toBe(after);
+    expect(a.closes.length).toBe(1);
+  }, 30_000);
+
+  it("an expired local session never reaches the relay", async () => {
+    const alice = await user("alice");
+    const { teamId } = await team(alice, [], [alice]);
+    const fetches = countFetches(teamId);
+    const a = channel(alice, teamId, { session: { login: alice.login, token: alice.token, expiresAt: Date.now() / 1000 - 1 } });
+    await waitFor(() => a.closes.length > 0);
+    expect(a.ch.status).toBe(SIGN_IN_EXPIRED);
+    await sleep(300);
+    expect(fetches()).toBe(0);
+  });
+
+  it("backs off exponentially with jitter while the relay is unreachable, and stop() cancels the retry", async () => {
+    const alice = await user("alice");
+    const ch = new TeamChannel({ relayHttp: "http://127.0.0.1:1", teamId: "0123456789abcdef", session: session(alice), id: alice.id, retry: { baseMs: 40, maxMs: 320 } });
+    ch.on("relay-error", () => {});
+    const delays: number[] = [];
+    ch.on("retry", (ms: number) => delays.push(ms));
+    ch.start();
+    cleanups.push(() => ch.stop());
+    await waitFor(() => delays.length >= 6, 10_000);
+    for (const [i, d] of delays.slice(0, 6).entries()) {
+      const exp = Math.min(320, 40 * 2 ** i);
+      expect(d).toBeGreaterThanOrEqual(exp * 0.8);
+      expect(d).toBeLessThanOrEqual(exp * 1.2);
+    }
+    await ch.stop();
+    const seen = delays.length;
+    await sleep(800);
+    expect(delays.length).toBe(seen);
+  }, 20_000);
+
+  it("backoffDelay starts at the base, doubles, caps and jitters", () => {
+    expect(backoffDelay(0, 2000, 60_000, 0.5)).toBe(2000);
+    expect(backoffDelay(1, 2000, 60_000, 0.5)).toBe(4000);
+    expect(backoffDelay(10, 2000, 60_000, 0.5)).toBe(60_000);
+    expect(backoffDelay(0, 2000, 60_000, 0)).toBe(1600);
+    expect(backoffDelay(0, 2000, 60_000, 1)).toBe(2400);
+    expect(backoffDelay(1000, 2000, 60_000, 1)).toBe(72_000);
+  });
 });

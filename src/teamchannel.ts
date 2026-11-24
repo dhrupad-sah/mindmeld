@@ -14,10 +14,24 @@ export interface TeamChannelOptions {
   teamId: string;
   session: Session;
   id: DeviceIdentity;
+  /** Reconnect backoff (tests shrink it). Default: 2s doubling to 60s. */
+  retry?: { baseMs: number; maxMs: number };
+}
+
+/** Shown when the relay refuses the session token (or it has expired locally). */
+export const SIGN_IN_EXPIRED = "sign-in expired; run /mindmeld:login";
+
+/**
+ * Reconnect delay after `failures` consecutive failures: base * 2^failures, capped at `maxMs`,
+ * with +/-20% jitter so a relay outage does not get every client back in lockstep.
+ */
+export function backoffDelay(failures: number, baseMs: number, maxMs: number, rand = Math.random()): number {
+  const exp = Math.min(maxMs, baseMs * 2 ** Math.min(failures, 30));
+  return Math.round(exp * (0.8 + 0.4 * rand));
 }
 
 /** Close codes the relay uses on team sockets. */
-export const TEAM_CLOSE = { removed: 4001, noKey: 4003, noTeam: 4004 } as const;
+export const TEAM_CLOSE = { removed: 4001, noKey: 4003, noTeam: 4004, signedOut: 4401 } as const;
 
 const TeamFrameSchema = z.object({ e: z.number().int(), dev: z.string(), d: z.string(), sig: z.string() });
 
@@ -30,7 +44,8 @@ const TeamMessage = z.discriminatedUnion("t", [
   z.object({ t: z.literal("msg"), f: TeamFrameSchema, c: z.string(), login: z.string() }),
 ]);
 
-const RETRY_MS = 2000;
+const RETRY_BASE_MS = 2000;
+const RETRY_MAX_MS = 60_000;
 const CLOSE_TIMEOUT_MS = 1000;
 /** A device without a key waits for one to be wrapped for it; no need to knock every 2s. */
 const NO_KEY_RETRY_MS = 30_000;
@@ -60,6 +75,13 @@ export class TeamChannel extends EventEmitter implements Channel {
   private refreshAgain = false;
   private keyProblems: string[] = [];
   private reason: string | null = null;
+  private retryTimer: NodeJS.Timeout | null = null;
+  /** Consecutive failed connection attempts; reset once the relay admits this device. */
+  private failures = 0;
+  /** Set when the relay answered 401 to the WebSocket upgrade. */
+  private authRefused = false;
+  /** `terminal` ran: its "closed" event was the last one. */
+  private finished = false;
   /** Encrypted frames this client has sent; lets tests check that idle sessions stay quiet. */
   framesSent = 0;
 
@@ -69,13 +91,56 @@ export class TeamChannel extends EventEmitter implements Channel {
 
   start(): void {
     this.stopped = false;
+    this.finished = false;
+    this.failures = 0;
     void this.connect();
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
     if (this.pingTimer) clearInterval(this.pingTimer);
     this.ws?.close();
+  }
+
+  /** Try again after the backoff delay (at least `minMs`). Emits "retry" (delayMs). */
+  private scheduleRetry(minMs = 0): void {
+    if (this.stopped) return;
+    const { baseMs, maxMs } = this.opts.retry ?? { baseMs: RETRY_BASE_MS, maxMs: RETRY_MAX_MS };
+    const delay = Math.max(minMs, backoffDelay(this.failures++, baseMs, maxMs));
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.connect();
+    }, delay);
+    this.retryTimer.unref?.();
+    this.emit("retry", delay);
+  }
+
+  /** Stop for good: retrying cannot help (signed out, removed, no such team). */
+  private terminal(code: number, reason: string): void {
+    if (this.finished) return;
+    this.finished = true;
+    this.stopped = true;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.setReason(reason);
+    if (reason === SIGN_IN_EXPIRED) this.emit("auth-expired", reason);
+    this.emit("closed", code, reason);
+    const ws = this.ws;
+    if (ws && ws.readyState !== WebSocket.CLOSED) ws.close();
+  }
+
+  /** A roster/keys fetch failed: 401/403/404 end the channel; anything else is reported. */
+  private refreshFailed(e: unknown): boolean {
+    this.emit("relay-error", e);
+    const status = (e as { status?: number }).status;
+    if (status === 401) this.terminal(TEAM_CLOSE.signedOut, SIGN_IN_EXPIRED);
+    else if (status === 403) this.terminal(TEAM_CLOSE.removed, "removed from team");
+    else if (status === 404) this.terminal(TEAM_CLOSE.noTeam, "no such team");
+    else return false;
+    return true;
   }
 
   /** Admitted by the relay (socket open and the relay's "server" hello received). */
@@ -146,22 +211,22 @@ export class TeamChannel extends EventEmitter implements Channel {
 
   private async connect(): Promise<void> {
     if (this.stopped) return;
+    if (!this.opts.session.token || this.opts.session.expiresAt <= Date.now() / 1000) {
+      return this.terminal(TEAM_CLOSE.signedOut, SIGN_IN_EXPIRED);
+    }
     try {
       await this.refresh();
     } catch (e) {
-      this.emit("relay-error", e);
-      const status = (e as { status?: number }).status;
-      if (status === 403 || status === 404) {
-        // Not (or no longer) in this team: retrying will not help.
-        this.stopped = true;
-        this.setReason(status === 403 ? "removed from team" : "no such team");
-        this.emit("closed", status === 403 ? TEAM_CLOSE.removed : TEAM_CLOSE.noTeam, this.reason);
-        return;
-      }
-      setTimeout(() => void this.connect(), RETRY_MS).unref?.();
+      if (!this.refreshFailed(e)) this.scheduleRetry();
       return;
     }
     if (this.stopped) return;
+    if (this.admitted) {
+      // A previous socket is still winding down; its close handler will ignore it from here on.
+      this.admitted = false;
+      this.emit("disconnected");
+    }
+    this.authRefused = false;
     const url = `${httpBase(this.opts.relayHttp).replace(/^http/, "ws")}/v1/teams/${this.opts.teamId}/ws`;
     // closeTimeout: once close frames are exchanged, do not wait 30s for a peer that keeps TCP half open
     // (seen with relay-initiated closes of hibernated sockets); "closed" must arrive promptly.
@@ -179,26 +244,33 @@ export class TeamChannel extends EventEmitter implements Channel {
       this.pingTimer.unref?.();
     });
     ws.on("message", (data) => this.handleMessage(data.toString()));
-    ws.on("error", (e) => this.emit("relay-error", e));
+    ws.on("error", (e) => {
+      // ws reports a refused upgrade as "Unexpected server response: <status>".
+      if (/Unexpected server response: 401\b/.test(e.message)) this.authRefused = true;
+      this.emit("relay-error", e);
+    });
     ws.on("close", (code, buf) => {
+      if (ws !== this.ws) return; // a stale socket from before a restart
       if (this.pingTimer) clearInterval(this.pingTimer);
       const wasAdmitted = this.admitted;
       this.admitted = false;
       this.cidLogin.clear();
       const reason = buf.toString();
-      this.emit("closed", code, reason);
-      let delay = RETRY_MS;
-      if (code === TEAM_CLOSE.removed || code === TEAM_CLOSE.noTeam) {
-        this.stopped = true;
-        this.setReason(code === TEAM_CLOSE.removed ? "removed from team" : "no such team");
-      } else if (code === TEAM_CLOSE.noKey) {
-        this.setReason("no team key yet");
-        delay = NO_KEY_RETRY_MS;
-      }
       // Always reported once admitted, even when stopped, so the daemon can drop its peers.
       if (wasAdmitted) this.emit("disconnected");
-      if (this.stopped) return;
-      setTimeout(() => void this.connect(), delay).unref?.();
+      if (this.stopped) {
+        if (!this.finished) this.emit("closed", code, reason);
+        return;
+      }
+      if (this.authRefused) return this.terminal(TEAM_CLOSE.signedOut, SIGN_IN_EXPIRED);
+      if (code === TEAM_CLOSE.removed) return this.terminal(code, "removed from team");
+      if (code === TEAM_CLOSE.noTeam) return this.terminal(code, "no such team");
+      this.emit("closed", code, reason);
+      if (code === TEAM_CLOSE.noKey) {
+        this.setReason("no team key yet");
+        return this.scheduleRetry(NO_KEY_RETRY_MS);
+      }
+      this.scheduleRetry();
     });
   }
 
@@ -216,9 +288,10 @@ export class TeamChannel extends EventEmitter implements Channel {
     switch (msg.t) {
       case "server":
         this.serverInfo = { t: "server", latest: msg.latest, minimum: msg.minimum };
-        if (msg.epoch !== this.currentEpoch) void this.refresh().catch((e) => this.emit("relay-error", e));
+        if (msg.epoch !== this.currentEpoch) void this.refresh().catch((e) => this.refreshFailed(e));
         if (!this.admitted) {
           this.admitted = true;
+          this.failures = 0;
           this.setReason(null);
           this.emit("connected");
         }
@@ -232,7 +305,7 @@ export class TeamChannel extends EventEmitter implements Channel {
         this.emit("left", msg.c);
         break;
       case "roster":
-        void this.refresh().catch((e) => this.emit("relay-error", e));
+        void this.refresh().catch((e) => this.refreshFailed(e));
         break;
       case "msg":
         this.receive(msg.f, msg.c, msg.login, true);
@@ -248,7 +321,7 @@ export class TeamChannel extends EventEmitter implements Channel {
     if (mayHold && !this.keys.has(f.e) && f.e > this.currentEpoch) {
       // Probably a rotation this client has not caught up with yet.
       if (this.held.length < MAX_HELD) this.held.push({ f, c, login: stamped });
-      void this.refresh().catch((e) => this.emit("relay-error", e));
+      void this.refresh().catch((e) => this.refreshFailed(e));
       return;
     }
     const opened = openFrame(f, this.keys, this.roster);
