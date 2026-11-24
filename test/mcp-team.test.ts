@@ -177,6 +177,50 @@ describe("team tools over MCP", () => {
     await until(sb, "status", "Team: core (you're member)");
   }, 60_000);
 
+  it("leave_group always asks in a dialog when it can, even with confirmed: true", async () => {
+    const { dir } = await home();
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, JSON.stringify({ secret: "cd".repeat(32), relay: relay.wsUrl, name: "erin" }));
+    const s = server(dir, { elicit: "decline" });
+    expect(await s.call("leave_group", { confirmed: true })).toContain("staying in the group");
+    expect(s.dialogs).toHaveLength(1);
+    expect(s.dialogs[0]).toContain("Leave your mindmeld group?");
+    expect(JSON.parse(readFileSync(configPath, "utf8")).secret).toBe("cd".repeat(32));
+  });
+
+  it("creating or joining a team clears the always-allow list", async () => {
+    const alice = unique("alice");
+    const bob = unique("bob");
+    const a = await home(alice);
+    const b = await home(bob);
+    // Names trusted in a legacy group must not carry over to GitHub logins.
+    for (const h of [a, b]) {
+      writeFileSync(join(h.dir, "config.json"), JSON.stringify({ secret: "ef".repeat(32), relay: relay.wsUrl, name: "x", trusted: [bob, alice, "mallory"] }));
+    }
+    const sa = server(a.dir);
+    expect(await sa.call("create_team", { name: "core" })).toContain("Created team");
+    expect(JSON.parse(readFileSync(join(a.dir, "config.json"), "utf8")).trusted ?? []).toEqual([]);
+    await sa.call("invite_member", { login: bob });
+    const sb = server(b.dir);
+    expect(await sb.call("accept_invite")).toContain("Joined team");
+    expect(JSON.parse(readFileSync(join(b.dir, "config.json"), "utf8")).trusted ?? []).toEqual([]);
+    expect(await until(sb, "status", "Team: core")).toContain("Always allowed (answered without dialogs): nobody");
+  }, 60_000);
+
+  it("join_peer and invite_peer refuse while a team is set, and change nothing", async () => {
+    const { dir } = await home();
+    const configPath = join(dir, "config.json");
+    const before = JSON.stringify({ relay: relay.wsUrl, name: "erin", team: { teamId: "0123456789abcdef", name: "core" } });
+    writeFileSync(configPath, before);
+    const s = server(dir);
+    for (const [tool, args] of [["join_peer", { code: "k7q2-9xmd-4tpa" }], ["invite_peer", {}]] as const) {
+      const r = await s.reply(tool, args);
+      expect(r.isError, tool).toBe(true);
+      expect(r.text, tool).toContain('this machine is using team "core"; legacy groups are inactive while a team is set');
+    }
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+  });
+
   it("an expired sign-in says so in status and in other tools", async () => {
     const { dir } = await home();
     writeFileSync(join(dir, "session.json"), JSON.stringify({ login: "erin", token: "t", expiresAt: Math.floor(Date.now() / 1000) - 60 }));

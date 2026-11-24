@@ -4,9 +4,9 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { answerWithFork } from "./answerer.js";
 import { generateGroupSecret, generateInviteCode } from "./crypto.js";
-import { DEFAULT_RELAY, defaultName, deleteConfig, loadConfig, saveConfig, type Config } from "./config.js";
+import { DEFAULT_RELAY, defaultName, deleteConfig, loadConfig, saveConfig, withTeam, type Config } from "./config.js";
 import { Daemon, type Decide, type Decision } from "./daemon.js";
-import { runMcpServer, teamLeaveNote } from "./mcp.js";
+import { runMcpServer, teamLeaveNote, teamSetNote } from "./mcp.js";
 import { runInviter, runJoiner } from "./pairing.js";
 import { loadSession } from "./auth/session.js";
 import { loadOrCreateIdentity } from "./identity.js";
@@ -82,7 +82,9 @@ async function main() {
       return;
     }
     case "pair": {
-      const prev = values["new-group"] ? null : loadConfigOrNull();
+      const current = loadConfigOrNull();
+      if (current?.team) throw new Error(teamSetNote(current.team.name));
+      const prev = values["new-group"] ? null : current;
       const secret = prev?.secret ?? generateGroupSecret();
       const config: Config = {
         ...prev,
@@ -105,6 +107,7 @@ async function main() {
       const code = positionals[0];
       if (!code) throw new Error("usage: mindmeld join <code>");
       const prev = loadConfigOrNull();
+      if (prev?.team) throw new Error(teamSetNote(prev.team.name));
       const relay = values.relay ?? prev?.relay ?? DEFAULT_RELAY;
       const name = values.name ?? prev?.name ?? defaultName();
       const { secret, inviterName } = await runJoiner({ relay, code, name });
@@ -174,7 +177,7 @@ async function team(args: string[], yes: boolean): Promise<void> {
   const session = s.session;
   const config = loadConfigOrNull();
   const relay = config?.relay ?? DEFAULT_RELAY;
-  const useTeam = (t: { teamId: string; name: string }) => saveConfig({ ...config, relay, name: config?.name ?? session.login, team: t });
+  const useTeam = (t: { teamId: string; name: string }) => saveConfig(withTeam(config, { relay, name: config?.name ?? session.login }, t));
   const current = () => {
     if (!config?.team) throw new Error("you're not in a team yet: mindmeld team create <name>, or mindmeld team accept");
     return config.team;

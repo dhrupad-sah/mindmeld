@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { loadSession, type Session } from "./auth/session.js";
 import type { Channel } from "./channel.js";
-import { DEFAULT_RELAY, relayWarning, saveConfig, type Config } from "./config.js";
+import { DEFAULT_RELAY, relayWarning, saveConfig, withTeam, type Config } from "./config.js";
 import { loadOrCreateIdentity } from "./identity.js";
 import {
   acceptInvite,
@@ -146,10 +146,13 @@ export function setupTeams(host: TeamHost) {
   /** What the config watcher compares: a change means reconnect. Includes the session for a team. */
   const watchKey = (c: Config | null) => [c?.secret ?? "", c?.team?.teamId ?? "", c?.team ? (loadSession()?.token ?? "") : ""].join("|");
 
-  /** Point config.json at `team`, keeping everything else. */
+  /**
+   * Point config.json at `team`, keeping everything else except the always-allow list when the team
+   * changes: names trusted in a legacy group (or another team) must not match a GitHub login here.
+   */
   function useTeam(r: Ready, team: { teamId: string; name: string }): string {
     const prev = r.config;
-    saveConfig({ ...(prev ?? {}), relay: r.relay, name: prev?.name ?? r.session.login, team });
+    saveConfig(withTeam(prev, { relay: r.relay, name: prev?.name ?? r.session.login }, team));
     host.reconnect();
     return prev?.team && prev.team.teamId !== team.teamId ? ` (This replaced team "${prev.team.name}" on this machine.)` : "";
   }

@@ -53,6 +53,16 @@ export function loadConfig(): Config | null {
 }
 export const saveConfig = (c: Config) => writeJson("config.json", c);
 
+/**
+ * `prev` switched to `team` (with `base` filled in). The always-allow list is dropped when the team
+ * changes, so a name trusted in a legacy group (or another team) can't match a GitHub login.
+ */
+export function withTeam(prev: Config | null, base: Pick<Config, "relay" | "name">, team: { teamId: string; name: string }): Config {
+  const { trusted, ...rest } = prev ?? ({} as Partial<Config>);
+  const same = prev?.team?.teamId === team.teamId;
+  return { ...rest, ...base, team, ...(same && trusted ? { trusted } : {}) } as Config;
+}
+
 /** Leave the group: forget the group secret (and the legacy copy, so it isn't migrated back). */
 export function deleteConfig(): void {
   rmSync(join(homeDir(), "config.json"), { force: true });

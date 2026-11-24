@@ -44,6 +44,11 @@ const STATE_TEXT: Record<AskState, string> = {
   drafting: "answer drafted; waiting for them to approve sending it",
 };
 
+/** Why the invite-code tools refuse while a team is set (the team channel would be used, not the group). */
+export const teamSetNote = (team: string) =>
+  `this machine is using team "${team}"; legacy groups are inactive while a team is set. ` +
+  "Invite teammates to the team with invite_member instead.";
+
 /** What leaving says when this machine is in a team: only a legacy group can be left for now. */
 export const teamLeaveNote = (team: string, leftGroup: boolean) =>
   `${leftGroup ? "Left the old invite-code group. " : "There's no invite-code group to leave. "}` +
@@ -398,17 +403,22 @@ export async function runMcpServer(): Promise<void> {
         "Disconnect this machine from the user's mindmeld group and forget the pairing, in every open session. " +
         "Only when the user asks to leave or disconnect. Reconnecting needs a new invite.",
       inputSchema: {
-        confirmed: z.boolean().optional().describe("Set true only if the user has explicitly confirmed in chat; otherwise a dialog asks them"),
+        confirmed: z
+          .boolean()
+          .optional()
+          .describe("Only used when this client can't show dialogs: set true after the user has explicitly confirmed in chat. Otherwise a dialog always asks them"),
       },
     },
     async ({ confirmed }) => {
       const current = loadConfigOrNull();
       if (!current) return text("You're not in a mindmeld group.");
       if (current.team && !current.secret) return text(teamLeaveNote(current.team.name, false));
-      if (!confirmed) {
-        if (!server.server.getClientCapabilities()?.elicitation) {
+      // The user confirms in a dialog whenever the client can show one; `confirmed` can't skip it.
+      if (!server.server.getClientCapabilities()?.elicitation) {
+        if (!confirmed) {
           return text("Ask the user to confirm leaving the group, then call leave_group again with confirmed: true.", true);
         }
+      } else {
         const r = await elicit(
           [
             "Leave your mindmeld group?",
@@ -472,6 +482,7 @@ export async function runMcpServer(): Promise<void> {
     },
     async ({ my_name }) => {
       const prev = loadConfigOrNull();
+      if (prev?.team) return text(teamSetNote(prev.team.name), true);
       const secret = prev?.secret ?? generateGroupSecret();
       const config: Config = {
         ...prev,
@@ -517,6 +528,7 @@ export async function runMcpServer(): Promise<void> {
     },
     async ({ code, my_name }) => {
       const prev = loadConfigOrNull();
+      if (prev?.team) return text(teamSetNote(prev.team.name), true);
       const relay = prev?.relay ?? DEFAULT_RELAY;
       const name = my_name ?? prev?.name ?? defaultName();
       try {
