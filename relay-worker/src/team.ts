@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { ed25519 } from "@noble/curves/ed25519.js";
 import { verifyToken, type AuthEnv, type DeviceRecord, type TeamIndexEntry, type TeamIndexRole } from "./auth.js";
 
 /**
@@ -10,7 +11,15 @@ import { verifyToken, type AuthEnv, type DeviceRecord, type TeamIndexEntry, type
  * - GET /v1/teams/:id -> { name, epoch, members, invites, log } (members only).
  * - POST /v1/teams/:id/invites { login } (admin); POST /v1/teams/:id/accept (invited caller).
  * - POST /v1/teams/:id/devices (member): add the caller's current device.
- * - PUT /v1/teams/:id/keys { epoch, wrapped } (member); GET /v1/teams/:id/keys (member).
+ * - PUT /v1/teams/:id/keys { epoch, wrapped: { [deviceId]: { sealed, sig } }, commit?: { hash, sig } } (member).
+ *   Each wrap's `sig` is Ed25519 by the caller's device over
+ *   utf8("mm-wrap|v1|" + teamId + "|" + epoch + "|" + recipientDeviceId + "|" + sealed). A rotation
+ *   (epoch = current + 1, admin only) needs `commit`: hash = hex sha256 of the raw 32-byte team key,
+ *   sig = Ed25519 by the admin's device over utf8("mm-epoch|v1|" + teamId + "|" + epoch + "|" + hash).
+ *   Any bad signature rejects the whole request (400). The relay stores who wrote each wrap.
+ * - GET /v1/teams/:id/keys (member) -> { epoch, wrapped: Wrap | null, epochs: { [n]: Wrap } } for the
+ *   caller's device (current plus up to 2 previous epochs), where
+ *   Wrap = { sealed, by, sig, commit: { hash, by, sig } | null } and `by` is the writer's deviceId.
  * - DELETE /v1/teams/:id/members/:login (admin) -> { needsRotation: true }.
  * - POST /v1/teams/:id/roles { login, role } (admin).
  * Errors: 404 for an unknown team (or malformed teamId), 403 for a non-member or a role that is not
@@ -44,6 +53,11 @@ export interface TeamResult {
 const HEX16 = /^[0-9a-f]{16}$/;
 const LOGIN = /^[a-z0-9-]{1,39}$/;
 const SEALED = /^[A-Za-z0-9+/]{1,2048}={0,2}$/;
+const HEX64 = /^[0-9a-f]{64}$/;
+const HEX128 = /^[0-9a-f]{128}$/;
+/** Signature domains: a wrap written by a device, and an admin's commitment to an epoch's key. */
+const WRAP_DOMAIN = "mm-wrap|v1|";
+const EPOCH_DOMAIN = "mm-epoch|v1|";
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_WRAPS = 512;
 /** Wrapped keys kept per device: the current epoch plus this many before it. */
@@ -69,12 +83,51 @@ async function readBody(req: Request): Promise<Record<string, unknown> | null> {
 
 const parseLogin = (v: unknown): string | null => (typeof v === "string" && LOGIN.test(v.toLowerCase()) ? v.toLowerCase() : null);
 
-function parseWrapped(v: unknown): Record<string, string> | null {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
-  const entries = Object.entries(v as Record<string, unknown>);
+/** A wrapped team key as sent by its writer: the sealed blob and the writer's signature. */
+export interface SignedWrap {
+  sealed: string;
+  sig: string;
+}
+
+/** An admin's signed commitment to an epoch's team key (hex sha256 of the raw key). */
+export interface EpochCommit {
+  hash: string;
+  sig: string;
+}
+
+const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+
+function parseWrapped(v: unknown): Record<string, SignedWrap> | null {
+  if (!isObj(v)) return null;
+  const entries = Object.entries(v);
   if (entries.length === 0 || entries.length > MAX_WRAPS) return null;
-  for (const [id, s] of entries) if (!HEX16.test(id) || typeof s !== "string" || !SEALED.test(s)) return null;
-  return v as Record<string, string>;
+  const out: Record<string, SignedWrap> = {};
+  for (const [id, w] of entries) {
+    if (!HEX16.test(id) || !isObj(w)) return null;
+    if (typeof w.sealed !== "string" || !SEALED.test(w.sealed) || typeof w.sig !== "string" || !HEX128.test(w.sig)) return null;
+    out[id] = { sealed: w.sealed, sig: w.sig };
+  }
+  return out;
+}
+
+function parseCommit(v: unknown): EpochCommit | null {
+  if (!isObj(v) || typeof v.hash !== "string" || !HEX64.test(v.hash) || typeof v.sig !== "string" || !HEX128.test(v.sig)) return null;
+  return { hash: v.hash, sig: v.sig };
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+/** Strict Ed25519 check (zip215: false) of `sig` by `signPub` over utf8(message). */
+function verifySig(signPub: string, message: string, sig: string): boolean {
+  try {
+    return ed25519.verify(hexToBytes(sig), new TextEncoder().encode(message), hexToBytes(signPub), { zip215: false });
+  } catch {
+    return false;
+  }
 }
 
 /** Verify the bearer token and load the caller's device from its Users record (null: 401). */
@@ -138,9 +191,17 @@ export async function handleTeams(req: Request, env: TeamEnv, pathname: string):
       case "PUT keys": {
         const epoch = body?.epoch;
         const wrapped = parseWrapped(body?.wrapped);
+        const commit = body?.commit === undefined ? undefined : parseCommit(body.commit);
         if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 1) return json(400, { error: "epoch must be an integer >= 1" });
-        if (!wrapped) return json(400, { error: "wrapped must map 16-hex device ids to sealed keys" });
-        r = await team.putKeys(caller, epoch, wrapped);
+        if (!wrapped) return json(400, { error: "wrapped must map 16-hex device ids to { sealed, sig }" });
+        if (commit === null) return json(400, { error: "commit must be { hash, sig }" });
+        // Every signature is by the caller's own device (keys from its Users record), checked before anything is stored.
+        const pub = caller.device.signPub;
+        for (const [id, w] of Object.entries(wrapped)) {
+          if (!verifySig(pub, `${WRAP_DOMAIN}${teamId}|${epoch}|${id}|${w.sealed}`, w.sig)) return json(400, { error: "bad wrap signature" });
+        }
+        if (commit && !verifySig(pub, `${EPOCH_DOMAIN}${teamId}|${epoch}|${commit.hash}`, commit.sig)) return json(400, { error: "bad epoch commit signature" });
+        r = await team.putKeys(caller, epoch, wrapped, commit);
         break;
       }
       case "GET keys":
@@ -186,7 +247,9 @@ export class Team extends DurableObject<TeamEnv> {
     sql.exec("CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK (id = 1), name TEXT NOT NULL, epoch INTEGER NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS members (login TEXT PRIMARY KEY, role TEXT NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS devices (deviceId TEXT PRIMARY KEY, login TEXT NOT NULL, signPub TEXT NOT NULL, boxPub TEXT NOT NULL)");
-    sql.exec("CREATE TABLE IF NOT EXISTS keys (epoch INTEGER NOT NULL, deviceId TEXT NOT NULL, sealed TEXT NOT NULL, PRIMARY KEY (epoch, deviceId))");
+    // by = deviceId that wrote the wrap (or the commit); sig = its signature, see the module notes.
+    sql.exec("CREATE TABLE IF NOT EXISTS keys (epoch INTEGER NOT NULL, deviceId TEXT NOT NULL, sealed TEXT NOT NULL, by TEXT NOT NULL, sig TEXT NOT NULL, PRIMARY KEY (epoch, deviceId))");
+    sql.exec("CREATE TABLE IF NOT EXISTS commits (epoch INTEGER PRIMARY KEY, hash TEXT NOT NULL, by TEXT NOT NULL, sig TEXT NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS invites (login TEXT PRIMARY KEY)");
     sql.exec("CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, by TEXT NOT NULL, event TEXT NOT NULL, subject TEXT NOT NULL)");
   }
@@ -310,24 +373,33 @@ export class Team extends DurableObject<TeamEnv> {
   }
 
   /**
-   * Store wrapped team keys. Lower epoch: 409. Same epoch (any member): adds wraps for devices
-   * that lack one, never replaces one (409). Higher epoch (admin only): a rotation, which must
-   * cover exactly the current devices; keys older than the two previous epochs are dropped.
+   * Store wrapped team keys (signatures already verified by the Worker against the caller's device).
+   * Lower epoch: 409. Same epoch (any member, no commit): adds wraps for devices that lack one,
+   * never replaces one (409). Higher epoch (admin only): a rotation to exactly current + 1 (else 409)
+   * with a commit, covering exactly the current devices; older than the two previous epochs is dropped.
    */
-  putKeys(caller: Caller, epoch: number, wrapped: Record<string, string>): TeamResult {
+  putKeys(caller: Caller, epoch: number, wrapped: Record<string, SignedWrap>, commit?: EpochCommit): TeamResult {
     const g = this.guard(caller);
     if ("status" in g) return g;
     if (epoch < g.epoch) return fail(409, "epoch is older than the current one");
     if (epoch > g.epoch && g.role !== "admin") return fail(403, "only admins rotate the team key");
+    if (epoch > g.epoch + 1) return fail(409, "a rotation must be to the next epoch");
+    if (epoch > g.epoch && !commit) return fail(400, "a rotation needs a signed epoch commit");
+    if (epoch === g.epoch && commit) return fail(400, "commit is only for a rotation");
+    const by = caller.device.deviceId;
+    const insert = (id: string) =>
+      this.sql.exec("INSERT INTO keys (epoch, deviceId, sealed, by, sig) VALUES (?, ?, ?, ?, ?)", epoch, id, wrapped[id].sealed, by, wrapped[id].sig);
     const current = new Set(this.sql.exec<{ deviceId: string }>("SELECT deviceId FROM devices").toArray().map((d) => d.deviceId));
     const ids = Object.keys(wrapped);
     if (ids.some((id) => !current.has(id))) return fail(400, "wrapped key for a device not in the team");
     if (epoch > g.epoch) {
       if (ids.length !== current.size) return fail(400, "rotation must cover every current device");
       this.ctx.storage.transactionSync(() => {
-        for (const id of ids) this.sql.exec("INSERT INTO keys (epoch, deviceId, sealed) VALUES (?, ?, ?)", epoch, id, wrapped[id]);
+        for (const id of ids) insert(id);
+        this.sql.exec("INSERT INTO commits (epoch, hash, by, sig) VALUES (?, ?, ?, ?)", epoch, commit!.hash, by, commit!.sig);
         this.sql.exec("UPDATE meta SET epoch = ? WHERE id = 1", epoch);
         this.sql.exec("DELETE FROM keys WHERE epoch < ?", epoch - PREVIOUS_EPOCHS);
+        this.sql.exec("DELETE FROM commits WHERE epoch < ?", epoch - PREVIOUS_EPOCHS);
         this.log(caller.login, "rotated", String(epoch));
       });
       return ok({ epoch });
@@ -335,24 +407,35 @@ export class Team extends DurableObject<TeamEnv> {
     const fresh: string[] = [];
     for (const id of ids) {
       const have = this.sql.exec<{ sealed: string }>("SELECT sealed FROM keys WHERE epoch = ? AND deviceId = ?", epoch, id).toArray()[0];
-      if (have && have.sealed !== wrapped[id]) return fail(409, "device already has a key for this epoch");
+      if (have && have.sealed !== wrapped[id].sealed) return fail(409, "device already has a key for this epoch");
       if (!have) fresh.push(id);
     }
     this.ctx.storage.transactionSync(() => {
-      for (const id of fresh) this.sql.exec("INSERT INTO keys (epoch, deviceId, sealed) VALUES (?, ?, ?)", epoch, id, wrapped[id]);
+      for (const id of fresh) insert(id);
     });
     return ok({ epoch, added: fresh.length });
   }
 
-  /** The caller's device's wrapped keys: current epoch, plus up to two previous ones in `epochs`. */
+  /**
+   * The caller's device's wraps: current epoch in `wrapped`, and current plus up to two previous
+   * ones in `epochs`, each as { sealed, by, sig, commit: { hash, by, sig } | null }.
+   */
   getKeys(caller: Caller): TeamResult {
     const g = this.guard(caller);
     if ("status" in g) return g;
     const rows = this.sql
-      .exec<{ epoch: number; sealed: string }>("SELECT epoch, sealed FROM keys WHERE deviceId = ? AND epoch >= ? AND epoch <= ? ORDER BY epoch", caller.device.deviceId, g.epoch - PREVIOUS_EPOCHS, g.epoch)
+      .exec<{ epoch: number; sealed: string; by: string; sig: string; chash: string | null; cby: string | null; csig: string | null }>(
+        "SELECT k.epoch, k.sealed, k.by, k.sig, c.hash AS chash, c.by AS cby, c.sig AS csig FROM keys k LEFT JOIN commits c ON c.epoch = k.epoch WHERE k.deviceId = ? AND k.epoch >= ? AND k.epoch <= ? ORDER BY k.epoch",
+        caller.device.deviceId,
+        g.epoch - PREVIOUS_EPOCHS,
+        g.epoch,
+      )
       .toArray();
-    const epochs: Record<number, string> = {};
-    for (const r of rows) epochs[r.epoch] = r.sealed;
+    type Wrap = { sealed: string; by: string; sig: string; commit: { hash: string; by: string; sig: string } | null };
+    const epochs: Record<number, Wrap> = {};
+    for (const r of rows) {
+      epochs[r.epoch] = { sealed: r.sealed, by: r.by, sig: r.sig, commit: r.chash ? { hash: r.chash, by: r.cby!, sig: r.csig! } : null };
+    }
     return ok({ epoch: g.epoch, wrapped: epochs[g.epoch] ?? null, epochs });
   }
 

@@ -1,9 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { openFromDevice } from "../src/teamcrypto.js";
 import { signInTestUser, type TestUser } from "./helpers/signin.js";
+import { epochCommit, keysBody, newTeamKey, signedWrap, verifyWrapSig, wrapSig } from "./helpers/teamkeys.js";
 import { startTestRelay, type TestRelay } from "./helpers/worker.js";
-
-/** Fake sealed blob (the relay treats them as opaque base64). */
-const sealed = (tag: string) => Buffer.from(`sealed:${tag}`).toString("base64");
 
 describe("team relay", () => {
   let relay: TestRelay;
@@ -73,7 +72,7 @@ describe("team relay", () => {
       ["POST", `/v1/teams/${teamId}/devices`, undefined],
       ["POST", `/v1/teams/${teamId}/accept`, undefined],
       ["POST", `/v1/teams/${teamId}/invites`, { login: mallory.login }],
-      ["PUT", `/v1/teams/${teamId}/keys`, { epoch: 1, wrapped: { [mallory.id.deviceId]: sealed("x") } }],
+      ["PUT", `/v1/teams/${teamId}/keys`, keysBody(mallory.id, teamId, 1, newTeamKey(), [mallory.id])],
     ] as const) {
       expect((await call(mallory, m, p, b)).status, `${m} ${p}`).toBe(403);
     }
@@ -126,8 +125,8 @@ describe("team relay", () => {
     expect((await call(bob2, "POST", `/v1/teams/${teamId}/devices`)).status).toBe(200);
     const bobDevices = (await roster(alice, teamId)).members.find((m: any) => m.login === bob.login).devices;
     expect(bobDevices.map((d: any) => d.deviceId)).toEqual([bob.id.deviceId, bob2.id.deviceId]);
-    const wrapped = Object.fromEntries([alice, bob, bob2].map((u) => [u.id.deviceId, sealed(`1:${u.id.deviceId}`)]));
-    expect((await call(alice, "PUT", `/v1/teams/${teamId}/keys`, { epoch: 1, wrapped })).status).toBe(200);
+    const body = keysBody(alice.id, teamId, 1, newTeamKey(), [alice.id, bob.id, bob2.id]);
+    expect((await call(alice, "PUT", `/v1/teams/${teamId}/keys`, body)).status).toBe(200);
 
     const del = await call(alice, "DELETE", `/v1/teams/${teamId}/members/${bob.login}`);
     expect(del).toEqual({ status: 200, body: { needsRotation: true } });
@@ -138,7 +137,7 @@ describe("team relay", () => {
       expect((await call(u, "GET", `/v1/teams/${teamId}/keys`)).status).toBe(403);
     }
     expect((await call(bob, "GET", "/v1/teams")).body).toEqual([]);
-    expect((await call(alice, "GET", `/v1/teams/${teamId}/keys`)).body.wrapped).toBe(sealed(`1:${alice.id.deviceId}`));
+    expect((await call(alice, "GET", `/v1/teams/${teamId}/keys`)).body.wrapped.sealed).toBe(body.wrapped[alice.id.deviceId].sealed);
     // Their wrapped keys went too: rejoining does not bring old keys back.
     await join(alice, teamId, bob);
     expect((await call(bob, "GET", `/v1/teams/${teamId}/keys`)).body).toEqual({ epoch: 1, wrapped: null, epochs: {} });
@@ -165,19 +164,26 @@ describe("team relay", () => {
     const bob = await user("bob");
     const teamId = await createTeam(alice);
     await join(alice, teamId, bob);
-    const all = (e: number) => ({ [alice.id.deviceId]: sealed(`${e}a`), [bob.id.deviceId]: sealed(`${e}b`) });
-    expect((await call(bob, "PUT", `/v1/teams/${teamId}/keys`, { epoch: 1, wrapped: all(1) })).status).toBe(403);
+    const [k1, k2] = [newTeamKey(), newTeamKey()];
+    const put = (u: TestUser, body: unknown) => call(u, "PUT", `/v1/teams/${teamId}/keys`, body);
+    expect((await put(bob, keysBody(bob.id, teamId, 1, k1, [alice.id, bob.id]))).status).toBe(403);
     expect((await roster(alice, teamId)).epoch).toBe(0);
-    expect((await call(alice, "PUT", `/v1/teams/${teamId}/keys`, { epoch: 2, wrapped: all(2) })).status).toBe(200);
+    expect((await put(alice, keysBody(alice.id, teamId, 1, k1, [alice.id, bob.id]))).status).toBe(200);
+    const b2 = keysBody(alice.id, teamId, 2, k2, [alice.id, bob.id]);
+    expect((await put(alice, b2)).status).toBe(200);
     // Lower epoch: refused for anyone.
-    expect((await call(alice, "PUT", `/v1/teams/${teamId}/keys`, { epoch: 1, wrapped: all(1) })).status).toBe(409);
+    expect((await put(alice, keysBody(alice.id, teamId, 1, k1, [alice.id, bob.id]))).status).toBe(409);
     // Same epoch: any member may add a wrap for a device that lacks one, but not overwrite one.
     const bob2 = await signInTestUser(relay, bob.login);
     expect((await call(bob2, "POST", `/v1/teams/${teamId}/devices`)).status).toBe(200);
-    expect((await call(bob, "PUT", `/v1/teams/${teamId}/keys`, { epoch: 2, wrapped: { [bob.id.deviceId]: sealed("evil") } })).status).toBe(409);
-    expect((await call(bob, "PUT", `/v1/teams/${teamId}/keys`, { epoch: 2, wrapped: { [bob2.id.deviceId]: sealed("2b2") } })).status).toBe(200);
-    expect((await call(bob2, "GET", `/v1/teams/${teamId}/keys`)).body).toEqual({ epoch: 2, wrapped: sealed("2b2"), epochs: { 2: sealed("2b2") } });
-    expect((await call(bob, "GET", `/v1/teams/${teamId}/keys`)).body.wrapped).toBe(sealed("2b"));
+    expect((await put(bob, keysBody(bob.id, teamId, 2, newTeamKey(), [bob.id], false))).status).toBe(409);
+    const add = keysBody(bob.id, teamId, 2, k2, [bob2.id], false);
+    expect((await put(bob, add)).status).toBe(200);
+    const got = (await call(bob2, "GET", `/v1/teams/${teamId}/keys`)).body;
+    const wrap = { ...add.wrapped[bob2.id.deviceId], by: bob.id.deviceId, commit: { ...b2.commit, by: alice.id.deviceId } };
+    expect(got).toEqual({ epoch: 2, wrapped: wrap, epochs: { 2: wrap } });
+    expect(openFromDevice(bob2.id, got.wrapped.sealed)).toEqual(k2);
+    expect((await call(bob, "GET", `/v1/teams/${teamId}/keys`)).body.wrapped.sealed).toBe(b2.wrapped[bob.id.deviceId].sealed);
     const r = await roster(alice, teamId);
     expect(r.members.flatMap((m: any) => m.devices.map((d: any) => d.hasKey))).toEqual([true, true, true]);
   });
@@ -188,18 +194,98 @@ describe("team relay", () => {
     const teamId = await createTeam(alice);
     await join(alice, teamId, bob);
     const keys = (body: unknown) => call(alice, "PUT", `/v1/teams/${teamId}/keys`, body);
-    expect((await keys({ epoch: 1, wrapped: { [alice.id.deviceId]: sealed("1a") } })).status).toBe(400);
-    expect((await keys({ epoch: 1, wrapped: { [alice.id.deviceId]: sealed("1a"), [bob.id.deviceId]: sealed("1b"), "0123456789abcdef": sealed("x") } })).status).toBe(400);
+    const k = newTeamKey();
+    expect((await keys(keysBody(alice.id, teamId, 1, k, [alice.id]))).status).toBe(400);
+    expect((await keys(keysBody(alice.id, teamId, 1, k, [alice.id, bob.id, { deviceId: "0123456789abcdef", boxPub: bob.id.boxPub }]))).status).toBe(400);
     expect((await roster(alice, teamId)).epoch).toBe(0);
+    const bodies = [];
     for (let e = 1; e <= 4; e++) {
-      expect((await keys({ epoch: e, wrapped: { [alice.id.deviceId]: sealed(`${e}a`), [bob.id.deviceId]: sealed(`${e}b`) } })).status).toBe(200);
+      const b = keysBody(alice.id, teamId, e, newTeamKey(), [alice.id, bob.id]);
+      bodies[e] = b;
+      expect((await keys(b)).status).toBe(200);
     }
-    // Current plus up to two previous epochs.
-    expect((await call(bob, "GET", `/v1/teams/${teamId}/keys`)).body).toEqual({
-      epoch: 4,
-      wrapped: sealed("4b"),
-      epochs: { 2: sealed("2b"), 3: sealed("3b"), 4: sealed("4b") },
-    });
+    // Current plus up to two previous epochs, each with who wrote it and the epoch commit.
+    const got = (await call(bob, "GET", `/v1/teams/${teamId}/keys`)).body;
+    const wrapAt = (e: number) => ({ ...bodies[e].wrapped[bob.id.deviceId], by: alice.id.deviceId, commit: { ...bodies[e].commit, by: alice.id.deviceId } });
+    expect(got).toEqual({ epoch: 4, wrapped: wrapAt(4), epochs: { 2: wrapAt(2), 3: wrapAt(3), 4: wrapAt(4) } });
+  });
+
+  it("forged wrap signature is rejected", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const teamId = await createTeam(alice);
+    await join(alice, teamId, bob);
+    const put = (u: TestUser, body: unknown) => call(u, "PUT", `/v1/teams/${teamId}/keys`, body);
+    const k = newTeamKey();
+    // Bob's wrap signed by a different device (bob's) though alice sends it.
+    const byOther = keysBody(alice.id, teamId, 1, k, [alice.id, bob.id]);
+    byOther.wrapped[bob.id.deviceId] = signedWrap(bob.id, teamId, 1, bob.id, k);
+    expect((await put(alice, byOther)).status).toBe(400);
+    // A signature made over a different recipient.
+    const otherRecipient = keysBody(alice.id, teamId, 1, k, [alice.id, bob.id]);
+    const w = otherRecipient.wrapped[bob.id.deviceId];
+    w.sig = wrapSig(alice.id, teamId, 1, alice.id.deviceId, w.sealed);
+    expect((await put(alice, otherRecipient)).status).toBe(400);
+    // Over a different team or epoch.
+    const otherEpoch = keysBody(alice.id, teamId, 1, k, [alice.id, bob.id]);
+    otherEpoch.wrapped[bob.id.deviceId].sig = wrapSig(alice.id, teamId, 2, bob.id.deviceId, otherEpoch.wrapped[bob.id.deviceId].sealed);
+    expect((await put(alice, otherEpoch)).status).toBe(400);
+    expect((await roster(alice, teamId)).epoch).toBe(0);
+    expect((await call(bob, "GET", `/v1/teams/${teamId}/keys`)).body).toEqual({ epoch: 0, wrapped: null, epochs: {} });
+    // Same-epoch add with a wrap signed by someone other than the caller.
+    expect((await put(alice, keysBody(alice.id, teamId, 1, k, [alice.id, bob.id]))).status).toBe(200);
+    const bob2 = await signInTestUser(relay, bob.login);
+    expect((await call(bob2, "POST", `/v1/teams/${teamId}/devices`)).status).toBe(200);
+    expect((await put(bob, keysBody(alice.id, teamId, 1, k, [bob2.id], false))).status).toBe(400);
+    expect((await call(bob2, "GET", `/v1/teams/${teamId}/keys`)).body.wrapped).toBeNull();
+  });
+
+  it("wrap records who wrote it", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const carol = await user("carol");
+    const teamId = await createTeam(alice);
+    await join(alice, teamId, bob);
+    await join(alice, teamId, carol);
+    const k = newTeamKey();
+    expect((await call(alice, "PUT", `/v1/teams/${teamId}/keys`, keysBody(alice.id, teamId, 1, k, [alice.id, bob.id, carol.id]))).status).toBe(200);
+    const carol2 = await signInTestUser(relay, carol.login);
+    expect((await call(carol2, "POST", `/v1/teams/${teamId}/devices`)).status).toBe(200);
+    expect((await call(bob, "PUT", `/v1/teams/${teamId}/keys`, keysBody(bob.id, teamId, 1, k, [carol2.id], false))).status).toBe(200);
+    const { wrapped } = (await call(carol2, "GET", `/v1/teams/${teamId}/keys`)).body;
+    expect(wrapped.by).toBe(bob.id.deviceId);
+    expect(verifyWrapSig(bob.id.signPub, teamId, 1, carol2.id.deviceId, wrapped.sealed, wrapped.sig)).toBe(true);
+    expect(wrapped.commit.by).toBe(alice.id.deviceId);
+    expect(openFromDevice(carol2.id, wrapped.sealed)).toEqual(k);
+  });
+
+  it("rotation without a valid commit is rejected", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const teamId = await createTeam(alice);
+    await join(alice, teamId, bob);
+    const k = newTeamKey();
+    const put = (body: unknown) => call(alice, "PUT", `/v1/teams/${teamId}/keys`, body);
+    const all = [alice.id, bob.id];
+    expect((await put(keysBody(alice.id, teamId, 1, k, all, false))).status).toBe(400);
+    expect((await put({ ...keysBody(alice.id, teamId, 1, k, all), commit: epochCommit(bob.id, teamId, 1, k) })).status).toBe(400);
+    expect((await put({ ...keysBody(alice.id, teamId, 1, k, all), commit: { ...epochCommit(alice.id, teamId, 2, k), hash: epochCommit(alice.id, teamId, 1, k).hash } })).status).toBe(400);
+    expect((await put({ ...keysBody(alice.id, teamId, 1, k, all), commit: { hash: "zz", sig: "00" } })).status).toBe(400);
+    expect((await roster(alice, teamId)).epoch).toBe(0);
+    expect((await put(keysBody(alice.id, teamId, 1, k, all))).status).toBe(200);
+    // A commit only belongs on a rotation.
+    expect((await put(keysBody(alice.id, teamId, 1, k, [alice.id]))).status).toBe(400);
+  });
+
+  it("rotation must be exactly current+1", async () => {
+    const alice = await user("alice");
+    const teamId = await createTeam(alice);
+    const put = (e: number) => call(alice, "PUT", `/v1/teams/${teamId}/keys`, keysBody(alice.id, teamId, e, newTeamKey(), [alice.id]));
+    expect((await put(2)).status).toBe(409);
+    expect((await put(1)).status).toBe(200);
+    expect((await put(3)).status).toBe(409);
+    expect((await put(2)).status).toBe(200);
+    expect((await roster(alice, teamId)).epoch).toBe(2);
   });
 
   it("log records invited, joined, removed in order", async () => {
@@ -230,13 +316,18 @@ describe("team relay", () => {
     }
     expect((await call(alice, "POST", `/v1/teams/${teamId}/roles`, { login: alice.login, role: "owner" })).status).toBe(400);
     const dev = alice.id.deviceId;
+    const good = keysBody(alice.id, teamId, 1, newTeamKey(), [alice.id]);
+    const w = good.wrapped[dev];
     for (const body of [
-      { epoch: 0, wrapped: { [dev]: sealed("a") } },
-      { epoch: 1.5, wrapped: { [dev]: sealed("a") } },
-      { epoch: "1", wrapped: { [dev]: sealed("a") } },
-      { epoch: 1, wrapped: { XYZ: sealed("a") } },
-      { epoch: 1, wrapped: { [dev]: 5 } },
-      { epoch: 1, wrapped: { [dev]: "not base64!" } },
+      { ...good, epoch: 0 },
+      { ...good, epoch: 1.5 },
+      { ...good, epoch: "1" },
+      { ...good, wrapped: { XYZ: w } },
+      { ...good, wrapped: { [dev]: 5 } },
+      { ...good, wrapped: { [dev]: w.sealed } },
+      { ...good, wrapped: { [dev]: { sealed: "not base64!", sig: w.sig } } },
+      { ...good, wrapped: { [dev]: { sealed: w.sealed } } },
+      { ...good, commit: { hash: good.commit.hash } },
       { epoch: 1 },
     ]) {
       expect((await call(alice, "PUT", `/v1/teams/${teamId}/keys`, body)).status, JSON.stringify(body)).toBe(400);
