@@ -1,17 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import WebSocket from "ws";
-import { keyFor, open, roomIdFor, seal } from "./crypto.js";
-import {
-  ACTIVITY_CHECK_MS,
-  ACTIVITY_RESOLUTION_MS,
-  Control,
-  Frame,
-  Payload,
-  PING_INTERVAL_MS,
-  PROTOCOL_VERSION,
-} from "./protocol.js";
-import { VERSION } from "./version.js";
+import { type Channel, GroupChannel, type PayloadSender, type ServerInfo } from "./channel.js";
+import { ACTIVITY_CHECK_MS, ACTIVITY_RESOLUTION_MS, Payload, PROTOCOL_VERSION } from "./protocol.js";
 
 type Ask = Extract<Payload, { type: "ask" }>;
 type Snippet = Extract<Payload, { type: "snippet" }>;
@@ -34,12 +24,14 @@ export interface PeerInfo {
   lastSeen: number;
 }
 
-export type ServerInfo = Extract<Control, { t: "server" }>;
+export type { ServerInfo };
 
 export interface DaemonOptions {
-  /** Group secret from pairing. */
+  /** Group secret from pairing. Used to build a GroupChannel when no `channel` is given. */
   secret: string;
   relay: string;
+  /** Transport to run over. Defaults to a GroupChannel built from `secret` / `relay`. */
+  channel?: Channel;
   name: string;
   project: string;
   decide: Decide;
@@ -71,16 +63,10 @@ interface PendingAsk {
 
 export class Daemon extends EventEmitter {
   readonly peerId = randomUUID();
-  private readonly key: Buffer;
-  private readonly roomUrl: string;
-  private ws: WebSocket | null = null;
+  private readonly channel: Channel;
   private activityTimer: NodeJS.Timeout | null = null;
-  private pingTimer: NodeJS.Timeout | null = null;
   private lastSentActive = 0;
-  private serverInfo: ServerInfo | null = null;
-  /** Encrypted frames this client has sent; lets tests check that idle sessions stay quiet. */
-  framesSent = 0;
-  private stopped = false;
+  private _stopped = false;
   private readonly peers = new Map<string, PeerInfo>();
   private readonly pending = new Map<string, PendingAsk>();
   private readonly inbox: Snippet[] = [];
@@ -90,13 +76,31 @@ export class Daemon extends EventEmitter {
   constructor(private readonly opts: DaemonOptions) {
     super();
     this.share = opts.share === undefined ? { label: opts.project } : opts.share;
-    this.key = keyFor(opts.secret);
-    const version = encodeURIComponent(opts.version ?? VERSION);
-    this.roomUrl = `${opts.relay.replace(/\/$/, "")}/room/${roomIdFor(opts.secret)}?v=${version}`;
+    this.channel = opts.channel ?? new GroupChannel({ secret: opts.secret, relay: opts.relay, version: opts.version });
+    this.wireChannel();
+  }
+
+  /** Encrypted frames this client has sent (only transports that count them report it). */
+  get framesSent(): number {
+    return (this.channel as { framesSent?: number }).framesSent ?? 0;
+  }
+
+  /** No reconnect and no "disconnected" event once stopped. Also forwarded to the channel (tests crash a daemon this way). */
+  get stopped(): boolean {
+    return this._stopped;
+  }
+  set stopped(v: boolean) {
+    this._stopped = v;
+    if ("stopped" in this.channel) (this.channel as { stopped: boolean }).stopped = v;
+  }
+
+  /** The channel's socket, if it has one. Kept so tests can kill the connection. */
+  get ws(): { terminate(): void } | null {
+    return (this.channel as { ws?: { terminate(): void } | null }).ws ?? null;
   }
 
   start(): void {
-    this.connect();
+    this.channel.start();
     // Re-announce only when "last active" moved enough to matter for routing; no heartbeat.
     this.activityTimer = setInterval(() => {
       if (!this.share) return;
@@ -108,16 +112,16 @@ export class Daemon extends EventEmitter {
 
   /** Version info from the relay: latest, minimum, and how many teammates run an old client. */
   get server(): ServerInfo | null {
-    return this.serverInfo;
+    return this.channel.server;
   }
 
   async stop(): Promise<void> {
-    this.stopped = true;
+    this._stopped = true;
     if (this.activityTimer) clearInterval(this.activityTimer);
-    if (this.pingTimer) clearInterval(this.pingTimer);
     this.send({ type: "bye", peer: this.peerId });
-    this.ws?.close();
+    const stopping = this.channel.stop();
     for (const p of this.pending.values()) p.resolve({ error: "daemon stopped" });
+    await stopping;
   }
 
   /** Peers present right now. The relay reports leaves, so there is no timeout to wait out. */
@@ -125,47 +129,42 @@ export class Daemon extends EventEmitter {
     return [...this.peers.values()];
   }
 
-  // ── relay connection ────────────────────────────────────────────────
+  // ── channel events ──────────────────────────────────────────────────
 
-  private connect(): void {
-    const ws = new WebSocket(this.roomUrl);
-    this.ws = ws;
-    ws.on("open", () => {
+  private wireChannel(): void {
+    const ch = this.channel;
+    ch.on("connected", () => {
       // Connection ids from a previous connection are meaningless now; shared peers re-announce
       // themselves in response to our "joined".
       this.peers.clear();
       this.emit("connected");
       this.sendHello();
-      let alive = true;
-      ws.on("pong", () => (alive = true));
-      if (this.pingTimer) clearInterval(this.pingTimer);
-      this.pingTimer = setInterval(() => {
-        if (!alive) return ws.terminate(); // half-open connection: reconnect
-        alive = false;
-        ws.ping();
-      }, PING_INTERVAL_MS);
-      this.pingTimer.unref?.();
     });
-    ws.on("message", (data) => this.handleFrame(data.toString()));
-    ws.on("error", (e) => this.emit("relay-error", e));
-    ws.on("close", () => {
-      if (this.pingTimer) clearInterval(this.pingTimer);
+    ch.on("disconnected", () => {
       for (const peer of [...this.peers.values()]) this.dropPeer(peer.peer, "disconnected from the relay");
-      if (this.stopped) return;
-      this.emit("disconnected");
-      setTimeout(() => !this.stopped && this.connect(), 2000);
+      if (!this._stopped) this.emit("disconnected");
     });
+    ch.on("relay-error", (e) => this.emit("relay-error", e));
+    ch.on("server", (info) => this.emit("server", info));
+    ch.on("blocked", (info) => {
+      this._stopped = true;
+      this.emit("blocked", info);
+    });
+    ch.on("joined", () => {
+      if (this.share) this.sendHello(); // let the newcomer see this shared session
+    });
+    ch.on("left", (cid: string) => {
+      for (const p of [...this.peers.values()]) if (p.cid === cid) this.dropPeer(p.peer, "closed");
+    });
+    ch.on("payload", (p: Payload, from: PayloadSender) => this.handlePayload(p, from));
   }
 
   private send(p: Payload): void {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
-    const frame: Frame = { t: "msg", d: seal(this.key, JSON.stringify(p)) };
-    this.ws.send(JSON.stringify(frame));
-    this.framesSent++;
+    this.channel.send(p);
   }
 
   get connected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.channel.connected;
   }
 
   get sharing(): { label: string } | null {
@@ -217,55 +216,20 @@ export class Daemon extends EventEmitter {
     }
   }
 
-  private handleControl(c: Control): void {
-    switch (c.t) {
-      case "server":
-        this.serverInfo = c;
-        if (c.blocked) {
-          this.stopped = true; // don't reconnect: the relay will refuse this version again
-          this.emit("blocked", c);
-        } else {
-          this.emit("server", c);
-        }
-        break;
-      case "joined":
-        if (this.share) this.sendHello(); // let the newcomer see this shared session
-        break;
-      case "left":
-        for (const p of [...this.peers.values()]) if (p.cid === c.c) this.dropPeer(p.peer, "closed");
-        break;
-    }
-  }
-
-  private handleFrame(raw: string): void {
-    let json: unknown;
-    try {
-      json = JSON.parse(raw);
-    } catch {
-      return;
-    }
-    const control = Control.safeParse(json);
-    if (control.success) return this.handleControl(control.data);
-    const f = Frame.safeParse(json);
-    if (!f.success) return;
-    const frame = f.data;
-    const plain = open(this.key, frame.d);
-    if (plain === null) return;
-    const parsed = Payload.safeParse(JSON.parse(plain));
-    if (!parsed.success) return;
-    const p = parsed.data;
-
+  private handlePayload(p: Payload, from: PayloadSender): void {
+    // An authenticated login beats any name the payload claims for itself.
+    const login = from.login;
     switch (p.type) {
       case "hello": {
         const isNew = !this.peers.has(p.peer);
         this.peers.set(p.peer, {
           peer: p.peer,
-          name: p.name,
+          name: login ?? p.name,
           project: p.project,
           session: p.session,
           activeAt: p.activeAt,
           v: p.v,
-          cid: frame.c,
+          cid: from.cid,
           lastSeen: Date.now(),
         });
         if (isNew) this.emit("peer-joined", this.peers.get(p.peer));
@@ -276,7 +240,7 @@ export class Daemon extends EventEmitter {
         break;
       case "ask":
         // Only a shared session answers, and only questions addressed to it (or legacy broadcasts).
-        if (this.share && (!p.to || p.to === this.opts.name || p.to === this.peerId)) void this.handleAsk(p);
+        if (this.share && (!p.to || p.to === this.opts.name || p.to === this.peerId)) void this.handleAsk(p, login);
         break;
       case "status": {
         const pending = this.pending.get(p.id);
@@ -290,14 +254,14 @@ export class Daemon extends EventEmitter {
         const pending = this.pending.get(p.id);
         if (pending) {
           this.pending.delete(p.id);
-          pending.resolve({ from: this.nameOf(p.from), text: p.text });
+          pending.resolve({ from: this.nameOf(p.from, undefined, login), text: p.text });
         }
         break;
       }
       case "decline": {
         const pending = this.pending.get(p.id);
         if (!pending) break;
-        pending.declines.push(`${this.nameOf(p.from)}: ${p.reason}`);
+        pending.declines.push(`${this.nameOf(p.from, undefined, login)}: ${p.reason}`);
         if (pending.declines.length >= pending.expected) {
           this.pending.delete(p.id);
           pending.resolve({ error: `declined — ${pending.declines.join("; ")}` });
@@ -306,15 +270,15 @@ export class Daemon extends EventEmitter {
       }
       case "snippet":
         if (!p.to || p.to === this.opts.name || p.to === this.peerId) {
-          this.inbox.push({ ...p, from: this.nameOf(p.from) });
+          this.inbox.push({ ...p, from: this.nameOf(p.from, undefined, login) });
           this.emit("snippet", p);
         }
         break;
     }
   }
 
-  private nameOf(peerId: string, fallback?: string): string {
-    return this.peers.get(peerId)?.name ?? fallback ?? peerId.slice(0, 8);
+  private nameOf(peerId: string, fallback?: string, login?: string): string {
+    return login ?? this.peers.get(peerId)?.name ?? fallback ?? peerId.slice(0, 8);
   }
 
   private rateLimited(from: string): boolean {
@@ -328,7 +292,7 @@ export class Daemon extends EventEmitter {
 
   private readonly seenAsks = new Set<string>();
 
-  private async handleAsk(ask: Ask): Promise<void> {
+  private async handleAsk(ask: Ask, login?: string): Promise<void> {
     if (this.seenAsks.has(ask.id)) return; // a resend of a question already being handled
     this.seenAsks.add(ask.id);
     const reply = (d: Decision) =>
@@ -342,7 +306,7 @@ export class Daemon extends EventEmitter {
       reply({ action: "decline", reason: "rate limited — too many questions, try again later" });
       return;
     }
-    const from = this.nameOf(ask.from, ask.fromName);
+    const from = this.nameOf(ask.from, ask.fromName, login);
     this.emit("question", { from, question: ask.question });
     try {
       const d = await this.opts.decide({ ...ask, from }, report);
