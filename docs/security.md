@@ -13,12 +13,14 @@ Both go through a relay (a Cloudflare Worker, [`relay-worker/`](../relay-worker/
 
 Teams:
 
-- Team names, member GitHub logins, roles, pending invites, and a membership log (who created, invited, joined, removed, rotated).
+- Team names, members' GitHub numeric user ids and current logins, roles, pending invites (by login), and a membership log (who created, invited, joined, removed, rotated).
 - Each device's public keys (Ed25519 signing key and X25519 box key) and device id.
 - Which devices are connected right now, when, and how much data moves.
 - Sealed (encrypted) team keys, one per device per epoch, and the signatures on them.
 
-The relay never sees team keys or the plaintext of anything the team sends. Frames pass through as ciphertext plus a signature. It also never stores your GitHub token: the token is used once to ask GitHub who you are, then dropped.
+The relay never sees team keys or the plaintext of anything the team sends. Frames pass through as ciphertext plus a signature. An honest relay (the hosted one runs the code in `relay-worker/`) also never stores your GitHub token: it uses the token once to ask GitHub who you are, then drops it. A relay you don't control can do whatever it likes with the token (see Known gaps).
+
+**Identity is the GitHub numeric user id.** GitHub logins can be renamed, and a freed login can be registered by someone else, so the relay keys accounts, team members, devices and keys by the numeric `id` from `GET /user`. The login is kept for display and refreshed whenever the member signs in or uses the team. Invites are addressed by login (that is what admins type) and bind to the GitHub id of whoever accepts them while holding that login.
 
 Legacy groups:
 
@@ -34,11 +36,13 @@ Source: `src/auth/github.ts`, `src/auth/session.ts`, `relay-worker/src/auth.ts`.
 
 1. **GitHub device flow.** The client asks GitHub for a user code, shows you the code and URL, and polls until you approve. mindmeld is a GitHub App, and its client id is public (`src/auth/config.ts`). Device flow needs no client secret, so no secret ships in mindmeld.
 2. **Challenge.** The client asks the relay for a nonce (`POST /v1/auth/challenge`). The nonce is stateless: `hex(32 random bytes) + hex(expiry, 8 bytes) + hex(HMAC-SHA256(TOKEN_SIGNING_KEY, "mm-challenge|v1|" + random + "|" + expiry))`. It is valid for 5 minutes.
-3. **Device proof.** The client sends the GitHub token, its device keys, the nonce, and an Ed25519 signature by its signing key over the UTF-8 string `mm-auth|v1|<nonce>|<deviceId>`. The relay checks the nonce MAC and expiry, then the signature (strict Ed25519, `zip215: false`), and only then asks GitHub (`GET /user`) whose token it is. This proves the caller holds the private key for the device it is registering.
-4. **Session token.** `base64url(JSON {login, deviceId, exp}) + "." + base64url(HMAC-SHA256(TOKEN_SIGNING_KEY, first part))`. `exp` is unix time in seconds. Tokens last 7 days. There is no refresh: when one expires you sign in again. The relay refuses to issue or accept tokens if `TOKEN_SIGNING_KEY` is missing or shorter than 32 bytes.
-5. The relay records the device under your login. If a device id is already registered with different keys, it refuses (409).
+3. **Device proof.** The client sends the GitHub token, its device keys, the nonce, and an Ed25519 signature by its signing key over the UTF-8 string `mm-auth|v1|<nonce>|<deviceId>`. The relay checks the nonce MAC and expiry, then the signature (strict Ed25519, `zip215: false`), and only then asks GitHub (`GET /user`) whose token it is (numeric `id` and `login`). This proves the caller holds the private key for the device it is registering.
+4. **Session token.** `base64url(JSON {uid, login, deviceId, exp}) + "." + base64url(HMAC-SHA256(TOKEN_SIGNING_KEY, first part))`, where `uid` is the GitHub numeric id. `exp` is unix time in seconds. Tokens last 7 days. There is no refresh: when one expires you sign in again. The relay refuses to issue or accept tokens if `TOKEN_SIGNING_KEY` is missing or shorter than 32 bytes.
+5. The relay records the device under your GitHub id. If a device id is already registered with different keys, it refuses (409).
 
-The session is saved in `session.json` (mode 600). The GitHub token is not saved.
+The session is saved in `session.json` (mode 600) together with the relay that issued it, and is only ever sent back to that relay. The GitHub token is not saved.
+
+**Which relay gets your credentials.** The client sends the GitHub token and session token only to the hosted relay, a loopback relay (`127.0.0.1` or `localhost`), or a relay you chose explicitly (`mindmeld login --relay`, which writes `teamRelay` into `config.json`, or that field written by hand). Environment variables (`MINDMELD_RELAY`, `CLAUDE_SHARE_RELAY`) and the legacy group's relay never decide where they go, because a project can set them. A session saved for one relay counts as signed out for any other. The GitHub device flow itself always runs against `https://github.com`; `MINDMELD_GITHUB_BASE` is honoured only as `http://127.0.0.1:<port>` or `http://localhost:<port>` (a local test mock).
 
 ## Device keys
 
@@ -101,7 +105,7 @@ Every message between team members is a frame `{ e, dev, d, sig }`:
 - `d = base64(nonce || ciphertext || tag)` of AES-256-GCM(team key for epoch `e`, payload, random 96-bit nonce, AAD = `"mindmeld/frame/v1|" + e + "|" + dev`).
 - `sig = Ed25519(signPriv, UTF-8(e + "|" + dev + "|" + d))`.
 
-The receiver looks up `dev` in the roster, **verifies the signature first**, then decrypts. The login attached to a message comes from the roster entry for the verified device, not from anything the relay stamps on it; a frame whose relay-stamped login disagrees is dropped. The relay forwards a frame only if `dev` is the sending socket's own device.
+The receiver checks that `dev` is 16 lowercase hex characters, looks it up in the roster, **verifies the signature first**, then decrypts. The sender (GitHub id, and login for display) comes from the roster entry for the verified device, not from anything the relay stamps on it; a frame whose relay-stamped GitHub id disagrees is dropped, and a connection stays bound to the GitHub id of its first verified frame. The relay forwards a frame only if `dev` is the sending socket's own device.
 
 ### Which signature checks are strict
 
@@ -150,9 +154,15 @@ Everyone in a legacy group holds the same secret. That is why there is no per-pe
 - **The relay distributes public keys.** Rosters, device keys and invites come from the relay, and clients trust them as given. A malicious or compromised relay could hand out a substituted key or plant an extra device for a member, and then receive team keys sealed to it. Mitigation: compare device fingerprints out of band using `/mindmeld:team`. Nothing forces you to do this. Admin-only rotation is enforced by the relay alone: a malicious relay could accept a rotation from a non-admin member's device, and clients would accept it.
 - **No replay, reorder or drop protection for team frames.** Frames carry no counter, so a relay (or anyone who captured a frame) can withhold or re-send valid frames within an epoch, including to a reconnecting device.
 - **No forward secrecy within an epoch.** Anyone who gets a team key can read every frame sent in that epoch, including recorded ones. Keys change only when an admin rotates (on removal).
-- **Stateless challenge replay window.** The sign-in challenge is not recorded as used, so within its 5 minute life the same nonce can be presented again. Using it still needs a valid device signature and a GitHub token for that login, so a replay by a third party does not help them.
-- **Names inside legacy groups are not authenticated.** Any member can claim another member's name, and "always allow" trusts a name.
+- **Stateless challenge replay window.** The sign-in challenge is not recorded as used, so within its 5 minute life the same nonce can be presented again. Using it still needs a valid device signature and a GitHub token for that account, so a replay by a third party does not help them.
+- **Names inside legacy groups are not authenticated.** Any member can claim another member's name, and "always allow" trusts a name. The "always allow" list is cleared when the machine switches to a team, so a legacy name can't match a GitHub login.
 - **The answering fork relies on Claude Code's permission rules.** If those rules have a bug, the fork's read limits do too.
-- **Relay override is allowed.** `MINDMELD_RELAY` and `--relay` point mindmeld at any relay, for self-hosting. Status shows the relay host when it is not the default. A relay you don't control sees everything in "what the relay knows".
+- **Relay override is allowed.** For legacy groups, `MINDMELD_RELAY` and `--relay` point mindmeld at any relay. For teams, only an explicit `mindmeld login --relay` (or `teamRelay` in `config.json`) does; environment variables don't. Status shows the relay host when it is not the default. A relay you don't control sees everything in "what the relay knows".
+- **A relay you choose receives your GitHub token and session token.** If you point teams at a relay you don't control, it gets the GitHub token at sign-in and your session token on every call. It could replay the GitHub token against other services that accept it (for example the hosted relay) and act as you there until the token expires or you revoke it on GitHub. Only choose relays you trust.
+- **The relay accepts any GitHub token that GitHub's `/user` accepts.** That includes personal access tokens and tokens issued to other apps, not only tokens issued to mindmeld's GitHub App. Anyone holding such a token for your account can sign in to mindmeld as you and register a device. Binding sign-in to mindmeld's app needs the app's client secret on the relay (to check the token with GitHub's application API); that is planned.
+- **Session tokens can't be revoked before they expire.** A session token is valid for 7 days. Removing the member from a team stops it working for that team, but there is no per-token or per-device revocation otherwise.
+- **The relay can delay or hide a removal or rotation.** Clients take the roster and the current epoch from the relay and don't check that they see the latest one. A malicious relay could keep showing a removed member, or keep a client on an old epoch, and that client would keep sealing to the old key.
+- **Frame metadata is in the clear.** The relay (and anyone on the path to it) sees each frame's epoch, sending device id, size and timing, and who is connected.
+- **A new device may never get the key.** A device that joins gets the team key only when a device that already holds it comes online. If no key holder comes online (for example the team's only other member has left for good), the new device keeps waiting; status says so.
 - **Session labels** come from Claude Code's on-disk transcript layout, which is not a documented API.
 - **Windows file protection** for `identity.json` and `session.json` is the user profile ACLs, not mode 600.

@@ -28,7 +28,7 @@ claude mcp add -s user mindmeld -- mindmeld mcp
 
 ## Teams (GitHub sign-in)
 
-A team is a group of people who sign in with GitHub. Each machine gets its own key pair, the team has a roster with admins and members, and an admin can remove someone for real: their devices are cut off and the team key is replaced, so they can't read anything sent afterwards. (Legacy groups below can't do that.) Teams need the hosted relay or your own relay running the 0.6 Worker.
+A team is a group of people who sign in with GitHub. Each machine gets its own key pair, the team has a roster with admins and members, and an admin can remove someone for real: their devices are cut off and the team key is replaced, so they can't read anything sent afterwards. (Legacy groups below can't do that.) Teams need the hosted relay or your own relay running the 0.6 Worker. To use your own for teams, sign in with `mindmeld login --relay wss://your-relay` (or set `"teamRelay"` in `~/.mindmeld/config.json`); environment variables never change where your GitHub sign-in goes.
 
 1. **Sign in, everyone, once:** `/mindmeld:login`. Claude shows a code and a link. Open the link, enter the code, approve on GitHub. Sign-in finishes on its own and `/mindmeld:status` shows who you are. It lasts 7 days, then you sign in again.
 2. **Create a team (an admin):** `/mindmeld:team create core`. You're its first admin and this machine is connected to it.
@@ -109,7 +109,7 @@ mindmeld relay                  # self-host a relay
 
 ## Relay
 
-By default, both sides connect to a hosted relay (a Cloudflare Worker, source in [`relay-worker/`](relay-worker/)). It only passes along encrypted frames and stores nothing. To run your own, use `mindmeld relay --port 8787` on any reachable machine, or deploy `relay-worker/` to your own Cloudflare account. Then pass `--relay ws://host:8787` to `pair` and `join`, or set `MINDMELD_RELAY`.
+By default, both sides connect to a hosted relay (a Cloudflare Worker, source in [`relay-worker/`](relay-worker/)). It only passes along encrypted frames and stores nothing. To run your own, use `mindmeld relay --port 8787` on any reachable machine, or deploy `relay-worker/` to your own Cloudflare account. Then pass `--relay ws://host:8787` to `pair` and `join`, or set `MINDMELD_RELAY` (invite-code groups only; teams use `mindmeld login --relay`, see above).
 
 ## Safety model
 
