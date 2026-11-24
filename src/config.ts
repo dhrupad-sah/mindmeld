@@ -62,7 +62,18 @@ export function deleteConfig(): void {
 }
 
 /** Hosted relay (Cloudflare Worker, relay-worker/). It only ever sees ciphertext. Override with --relay or MINDMELD_RELAY. */
-export const DEFAULT_RELAY = process.env.MINDMELD_RELAY ?? process.env.CLAUDE_SHARE_RELAY ?? "wss://claude-share-relay.thedhrupad.workers.dev";
+export const HOSTED_RELAY = "wss://claude-share-relay.thedhrupad.workers.dev";
+export const DEFAULT_RELAY = process.env.MINDMELD_RELAY ?? process.env.CLAUDE_SHARE_RELAY ?? HOSTED_RELAY;
+
+/** "Relay: <host> (not the default)" when `relay` isn't the hosted relay (self-hosting is allowed, but the user should see it). */
+export function relayWarning(relay: string): string | null {
+  if (relay.replace(/\/+$/, "") === HOSTED_RELAY) return null;
+  let host = relay;
+  try {
+    host = new URL(relay).host || relay;
+  } catch {}
+  return `Relay: ${host} (not the default)`;
+}
 /** git's user.name if set, else the OS username. */
 export function defaultName(): string {
   try {

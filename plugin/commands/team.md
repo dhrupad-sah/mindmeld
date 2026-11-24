@@ -8,7 +8,7 @@ Pick the mindmeld tool from the arguments:
 - nothing: the team tool, and show me its result as is
 - create <name>: create_team with that name
 - invite <github-login>: invite_member, then show me the message to send them, ready to copy
-- accept [team]: accept_invite (pass the team if I named one)
+- accept [team]: accept_invite (pass the team if I named one). It also connects this machine to a team I am already in
 - remove <github-login>: remove_member (it asks me to confirm in a dialog)
 - role <github-login> admin|member: set_role
 

@@ -44,6 +44,11 @@ const STATE_TEXT: Record<AskState, string> = {
   drafting: "answer drafted; waiting for them to approve sending it",
 };
 
+/** What leaving says when this machine is in a team: only a legacy group can be left for now. */
+export const teamLeaveNote = (team: string, leftGroup: boolean) =>
+  `${leftGroup ? "Left the old invite-code group. " : "There's no invite-code group to leave. "}` +
+  `This machine is still in team "${team}": leaving a team isn't supported yet. Ask a team admin to remove you.`;
+
 const text = (t: string, isError = false) => ({ content: [{ type: "text" as const, text: t }], isError });
 
 function loadConfigOrNull(): Config | null {
@@ -397,7 +402,9 @@ export async function runMcpServer(): Promise<void> {
       },
     },
     async ({ confirmed }) => {
-      if (!loadConfigOrNull()) return text("You're not in a mindmeld group.");
+      const current = loadConfigOrNull();
+      if (!current) return text("You're not in a mindmeld group.");
+      if (current.team && !current.secret) return text(teamLeaveNote(current.team.name, false));
       if (!confirmed) {
         if (!server.server.getClientCapabilities()?.elicitation) {
           return text("Ask the user to confirm leaving the group, then call leave_group again with confirmed: true.", true);
@@ -412,6 +419,13 @@ export async function runMcpServer(): Promise<void> {
           { type: "object", properties: {} },
         );
         if (r.action !== "accept") return text("Okay, staying in the group.");
+      }
+      if (current.team) {
+        // Only the legacy group goes; the team stays (leaving a team isn't supported yet).
+        const { secret: _gone, trusted: _t, ...rest } = current;
+        saveConfig(rest);
+        reconnect();
+        return text(teamLeaveNote(current.team.name, true));
       }
       disconnect();
       deleteConfig();

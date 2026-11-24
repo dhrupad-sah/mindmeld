@@ -82,11 +82,21 @@ export const setRole = (relay: string, s: Session, teamId: string, login: string
   teamCall(relay, s, "POST", `/v1/teams/${teamId}/roles`, { login: normLogin(login), role });
 
 /**
+ * Where the device flow runs. Always https://github.com, except in tests or development
+ * (NODE_ENV=test or MINDMELD_DEV=1), where MINDMELD_GITHUB_BASE may point it at a mock. Otherwise a
+ * project-supplied env could send the sign-in, and the user's GitHub token, to another host.
+ */
+export function githubBase(env: NodeJS.ProcessEnv = process.env): string {
+  const dev = env.NODE_ENV === "test" || env.MINDMELD_DEV === "1";
+  return dev && env.MINDMELD_GITHUB_BASE ? env.MINDMELD_GITHUB_BASE : "https://github.com";
+}
+
+/**
  * GitHub device-flow sign-in, then the exchange for a relay session (saved to session.json).
- * `onCode` gets the code to show the user. MINDMELD_GITHUB_BASE points the flow elsewhere (tests).
+ * `onCode` gets the code to show the user.
  */
 export async function signIn(relay: string, onCode: (userCode: string, verificationUri: string) => void): Promise<Session> {
-  const token = await deviceFlowLogin({ clientId: GITHUB_CLIENT_ID, onCode, githubBase: process.env.MINDMELD_GITHUB_BASE });
+  const token = await deviceFlowLogin({ clientId: GITHUB_CLIENT_ID, onCode, githubBase: githubBase() });
   return exchange(relay, token, loadOrCreateIdentity());
 }
 

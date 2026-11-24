@@ -1,10 +1,10 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { exchange } from "../src/auth/session.js";
 import { fingerprint, loadOrCreateIdentity, type DeviceIdentity } from "../src/identity.js";
-import { removeAndRotate } from "../src/teamapi.js";
+import { githubBase, removeAndRotate } from "../src/teamapi.js";
 import { WAITING_FOR_KEY } from "../src/teamkeys.js";
 import { startServer } from "./helpers/mcpserver.js";
 import { startTestRelay, type TestRelay } from "./helpers/worker.js";
@@ -43,8 +43,8 @@ describe("team tools over MCP", () => {
       else process.env.MINDMELD_HOME = prev;
     }
   }
-  function server(dir: string) {
-    const s = startServer(dir, { MINDMELD_RELAY: relay.url, MINDMELD_GITHUB_BASE: relay.github.url });
+  function server(dir: string, opts: Parameters<typeof startServer>[2] = {}) {
+    const s = startServer(dir, { MINDMELD_RELAY: relay.url, MINDMELD_GITHUB_BASE: relay.github.url, MINDMELD_DEV: "1" }, opts);
     stops.push(s.stop);
     return s;
   }
@@ -87,6 +87,7 @@ describe("team tools over MCP", () => {
     expect(await sa.call("create_team", { name: "core" })).toContain('Created team "core"');
     let st = await until(sa, "status", "Connection: connected");
     expect(st).toContain(`Signed in: @${alice}`);
+    expect(st).toContain(`Relay: ${new URL(relay.url).host} (not the default)`);
     expect(st).toContain("Team: core (you're admin)");
 
     const inv = await sa.call("invite_member", { login: bob.toUpperCase() });
@@ -128,6 +129,54 @@ describe("team tools over MCP", () => {
     await until(sb, "status", "removed from team");
   }, 120_000);
 
+  it("remove_member always asks in a dialog when it can, even with confirmed: true", async () => {
+    const alice = unique("alice");
+    const bob = unique("bob");
+    const a = await home(alice);
+    const b = await home(bob);
+    const sa = server(a.dir, { elicit: "decline" });
+    expect(await sa.call("create_team", { name: "core" })).toContain("Created team");
+    await sa.call("invite_member", { login: bob });
+    const sb = server(b.dir);
+    expect(await sb.call("accept_invite")).toContain("Joined team");
+
+    expect(await sa.call("remove_member", { login: bob, confirmed: true })).toContain(`@${bob} stays in the team`);
+    expect(sa.dialogs).toHaveLength(1);
+    expect(sa.dialogs[0]).toContain(`Remove @${bob}`);
+    expect(await sa.call("team")).toContain(`@${bob} (member)`); // no DELETE was sent
+  }, 60_000);
+
+  it("leaving keeps the team, and a member whose config lost the team can pick it again", async () => {
+    const alice = unique("alice");
+    const bob = unique("bob");
+    const a = await home(alice);
+    const b = await home(bob);
+    const sa = server(a.dir);
+    await sa.call("create_team", { name: "core" });
+    await sa.call("invite_member", { login: bob });
+    const sb = server(b.dir);
+    await sb.call("accept_invite");
+
+    const configPath = join(b.dir, "config.json");
+    expect(await sb.call("leave_group", { confirmed: true })).toContain("leaving a team isn't supported yet");
+    expect(JSON.parse(readFileSync(configPath, "utf8")).team.name).toBe("core");
+
+    // A legacy group next to the team: leaving drops only the group secret.
+    writeFileSync(configPath, JSON.stringify({ ...JSON.parse(readFileSync(configPath, "utf8")), secret: "ab".repeat(32) }));
+    expect(await sb.call("leave_group", { confirmed: true })).toContain("Left the old invite-code group");
+    const left = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(left.secret).toBeUndefined();
+    expect(left.team.name).toBe("core");
+
+    // Config without the team (e.g. from an older build): the member selects it again.
+    const { team: _t, ...rest } = left;
+    writeFileSync(configPath, JSON.stringify(rest));
+    await sleep(3500); // the watcher follows the change
+    expect(await sb.call("team")).toContain('team "core" (member)');
+    expect(await sb.call("accept_invite", { team: "core" })).toContain('now uses team "core"');
+    await until(sb, "status", "Team: core (you're member)");
+  }, 60_000);
+
   it("an expired sign-in says so in status and in other tools", async () => {
     const { dir } = await home();
     writeFileSync(join(dir, "session.json"), JSON.stringify({ login: "erin", token: "t", expiresAt: Math.floor(Date.now() / 1000) - 60 }));
@@ -138,6 +187,16 @@ describe("team tools over MCP", () => {
     expect(st).toContain("Team: core");
     expect(await s.call("list_peers")).toContain("Sign-in expired: run /mindmeld:login");
     expect(await s.call("team")).toContain("Sign-in expired: run /mindmeld:login");
+  });
+});
+
+describe("githubBase", () => {
+  it("ignores MINDMELD_GITHUB_BASE outside tests and development", () => {
+    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://evil.example" })).toBe("https://github.com");
+    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://evil.example", NODE_ENV: "production" })).toBe("https://github.com");
+    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://mock", NODE_ENV: "test" })).toBe("http://mock");
+    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://mock", MINDMELD_DEV: "1" })).toBe("http://mock");
+    expect(githubBase({})).toBe("https://github.com");
   });
 });
 

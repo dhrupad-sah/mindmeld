@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { loadSession, type Session } from "./auth/session.js";
 import type { Channel } from "./channel.js";
-import { DEFAULT_RELAY, saveConfig, type Config } from "./config.js";
+import { DEFAULT_RELAY, relayWarning, saveConfig, type Config } from "./config.js";
 import { loadOrCreateIdentity } from "./identity.js";
 import {
   acceptInvite,
@@ -28,6 +28,9 @@ import { SIGN_IN_EXPIRED, TeamChannel } from "./teamchannel.js";
 import { rotate, type TeamRoster } from "./teamkeys.js";
 
 const NO_TEAM = "You're not in a team yet. Create one with create_team, or accept an invite with accept_invite.";
+
+/** "invite to "core"" or "team "core" (member)". */
+const describeEntry = (t: TeamEntry) => (t.role === "invited" ? `invite to "${t.name}"` : `team "${t.name}" (${t.role})`);
 
 const text = (t: string, isError = false) => ({ content: [{ type: "text" as const, text: t }], isError });
 
@@ -129,6 +132,8 @@ export function setupTeams(host: TeamHost) {
       if (channelExpired) signedIn = SIGNED_IN_EXPIRED;
       teamText = teamLine(config.team.name, roster, "session" in s ? s.session.login : null) + failed;
     }
+    const relay = relayWarning(config?.relay ?? DEFAULT_RELAY);
+    if (relay) lines.push(relay);
     lines.push(signedIn);
     if (login.pending && !("session" in s)) lines.push("Sign-in in progress: waiting for the code to be entered on GitHub");
     if (login.error) lines.push(`Last sign-in attempt failed: ${login.error}`);
@@ -233,29 +238,35 @@ export function setupTeams(host: TeamHost) {
   server.registerTool(
     "accept_invite",
     {
-      title: "Accept a team invite",
-      description: "Accept an invite to a mindmeld team and connect this machine to it. Optional team name or id when there are several invites.",
-      inputSchema: { team: z.string().optional().describe("Team name or id, if there is more than one invite") },
+      title: "Accept a team invite (or use a team you're in)",
+      description:
+        "Accept an invite to a mindmeld team and connect this machine to it. Also connects this machine to a team the user already belongs to. " +
+        "Optional team name or id when there are several.",
+      inputSchema: { team: z.string().optional().describe("Team name or id, if there is more than one") },
     },
     async ({ team }) => {
       const r = ready(false);
       if (typeof r === "string") return text(r, true);
       return attempt(async () => {
-        const invites = (await listTeams(r.relay, r.session)).filter((t) => t.role === "invited");
+        const teams = await listTeams(r.relay, r.session);
         const q = team?.trim().toLowerCase();
-        const match = q ? invites.filter((t) => t.teamId === q || t.name.toLowerCase() === q) : invites;
+        const match = q ? teams.filter((t) => t.teamId === q || t.name.toLowerCase() === q) : teams;
         if (match.length === 0) {
           return text(
-            q && invites.length
-              ? `No invite to "${team}". Pending invites: ${invites.map((t) => `"${t.name}"`).join(", ")}.`
+            q && teams.length
+              ? `No invite to or team called "${team}". Yours: ${teams.map(describeEntry).join(", ")}.`
               : `No pending invites for @${r.session.login}. Ask a team admin to invite your GitHub login (@${r.session.login}).`,
             true,
           );
         }
         if (match.length > 1) {
-          return text(`You have invites to ${match.map((t: TeamEntry) => `"${t.name}" (${t.teamId})`).join(", ")}. Which one? Call accept_invite with team set.`, true);
+          return text(`You have ${match.map((t) => `${describeEntry(t)} (${t.teamId})`).join(", ")}. Which one? Call accept_invite with team set.`, true);
         }
         const t = match[0];
+        if (t.role !== "invited") {
+          const replaced = useTeam(r, { teamId: t.teamId, name: t.name });
+          return text(`This machine now uses team "${t.name}", where you're ${t.role}.${replaced}`);
+        }
         await acceptInvite(r.relay, r.session, t.teamId);
         const replaced = useTeam(r, { teamId: t.teamId, name: t.name });
         return text(
@@ -279,8 +290,9 @@ export function setupTeams(host: TeamHost) {
       if (typeof r === "string") return text(r, true);
       return attempt(async () => {
         if (!r.config?.team) {
-          const invites = (await listTeams(r.relay, r.session)).filter((t) => t.role === "invited");
-          return text(invites.length ? `${NO_TEAM}\nPending invites: ${invites.map((t) => `"${t.name}"`).join(", ")}.` : NO_TEAM);
+          const teams = await listTeams(r.relay, r.session);
+          if (teams.length === 0) return text(NO_TEAM);
+          return text(`This machine isn't using a team. Yours: ${teams.map(describeEntry).join(", ")}. Use accept_invite with the team's name to use one here.`);
         }
         const roster = await getRoster(r.relay, r.session, r.config.team.teamId);
         return text(formatTeam(roster, { login: r.session.login, deviceId: loadOrCreateIdentity().deviceId }));
@@ -297,17 +309,22 @@ export function setupTeams(host: TeamHost) {
         "Only when the user asks. A dialog asks them to confirm.",
       inputSchema: {
         login: z.string().min(1).describe("Their GitHub login"),
-        confirmed: z.boolean().optional().describe("Set true only if the user has explicitly confirmed in chat; otherwise a dialog asks them"),
+        confirmed: z
+          .boolean()
+          .optional()
+          .describe("Only used when this client can't show dialogs: set true after the user has explicitly confirmed in chat. Otherwise a dialog always asks them"),
       },
     },
     async ({ login: who, confirmed }) => {
       const r = ready(true);
       if (typeof r === "string") return text(r, true);
       const target = normLogin(who);
-      if (!confirmed) {
-        if (!server.server.getClientCapabilities()?.elicitation) {
+      // The user confirms in a dialog whenever the client can show one; `confirmed` can't skip it.
+      if (!server.server.getClientCapabilities()?.elicitation) {
+        if (!confirmed) {
           return text(`Ask the user to confirm removing @${target} from team "${r.team.name}", then call remove_member again with confirmed: true.`, true);
         }
+      } else {
         const a = await host.elicit(
           [
             `Remove @${target} from team "${r.team.name}"?`,

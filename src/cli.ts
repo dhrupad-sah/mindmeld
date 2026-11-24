@@ -6,7 +6,7 @@ import { answerWithFork } from "./answerer.js";
 import { generateGroupSecret, generateInviteCode } from "./crypto.js";
 import { DEFAULT_RELAY, defaultName, deleteConfig, loadConfig, saveConfig, type Config } from "./config.js";
 import { Daemon, type Decide, type Decision } from "./daemon.js";
-import { runMcpServer } from "./mcp.js";
+import { runMcpServer, teamLeaveNote } from "./mcp.js";
 import { runInviter, runJoiner } from "./pairing.js";
 import { loadSession } from "./auth/session.js";
 import { loadOrCreateIdentity } from "./identity.js";
@@ -44,7 +44,7 @@ const USAGE = `mindmeld — let teammates' Claude Code sessions ask each other q
   mindmeld team                                    show your team: members, devices, invites, activity
   mindmeld team create <name>                      create a team (you're its admin)
   mindmeld team invite <github-login>              invite someone (admins)
-  mindmeld team accept [team]                      accept an invite
+  mindmeld team accept [team]                      accept an invite, or use a team you're already in
   mindmeld team remove <github-login> [-y]         remove someone and rotate the team key (admins)
   mindmeld team role <github-login> admin|member   change someone's role (admins)
   mindmeld sessions                                list Claude sessions in this directory
@@ -114,8 +114,13 @@ async function main() {
       return;
     }
     case "leave": {
-      if (!loadConfigOrNull()) {
+      const current = loadConfigOrNull();
+      if (!current) {
         console.log("You're not in a mindmeld group.");
+        return;
+      }
+      if (current.team && !current.secret) {
+        console.log(teamLeaveNote(current.team.name, false));
         return;
       }
       if (!values.yes) {
@@ -123,6 +128,12 @@ async function main() {
         const a = (await rl.question("Leave your mindmeld group? Every session on this machine disconnects, and you'll need a new invite to reconnect. [y/N] ")).trim().toLowerCase();
         rl.close();
         if (a !== "y" && a !== "yes") return;
+      }
+      if (current.team) {
+        const { secret: _gone, trusted: _t, ...rest } = current;
+        saveConfig(rest);
+        console.log(teamLeaveNote(current.team.name, true));
+        return;
       }
       deleteConfig();
       console.log(`${cyan("✓")} left the group. Open Claude sessions disconnect within a few seconds.`);
@@ -195,11 +206,16 @@ async function team(args: string[], yes: boolean): Promise<void> {
       return;
     }
     case "accept": {
-      const invites = (await listTeams(relay, session)).filter((t) => t.role === "invited");
+      const teams = await listTeams(relay, session);
       const q = args.slice(1).join(" ").trim().toLowerCase();
-      const match = q ? invites.filter((t) => t.teamId === q || t.name.toLowerCase() === q) : invites;
-      if (match.length === 0) throw new Error(`no pending invite${q ? ` to "${q}"` : ""} for @${session.login}`);
-      if (match.length > 1) throw new Error(`invites to ${match.map((t) => `"${t.name}"`).join(", ")}: say which, e.g. mindmeld team accept ${match[0].name}`);
+      const match = q ? teams.filter((t) => t.teamId === q || t.name.toLowerCase() === q) : teams;
+      if (match.length === 0) throw new Error(`no pending invite or team${q ? ` called "${q}"` : ""} for @${session.login}`);
+      if (match.length > 1) throw new Error(`several teams and invites (${match.map((t) => `"${t.name}"`).join(", ")}): say which, e.g. mindmeld team accept ${match[0].name}`);
+      if (match[0].role !== "invited") {
+        useTeam({ teamId: match[0].teamId, name: match[0].name });
+        console.log(`${cyan("✓")} this machine now uses team ${bold(match[0].name)}, where you're ${match[0].role}.`);
+        return;
+      }
       await acceptInvite(relay, session, match[0].teamId);
       useTeam({ teamId: match[0].teamId, name: match[0].name });
       console.log(`${cyan("✓")} joined team ${bold(match[0].name)}. A teammate's mindmeld gives this device the team key when one of them is online.`);
