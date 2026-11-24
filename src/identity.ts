@@ -17,10 +17,35 @@ export interface DeviceIdentity {
 
 const sha256Hex = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 
+/** Parse and verify an existing identity file; never regenerates, since that would change the device identity. */
+function readIdentity(path: string): DeviceIdentity {
+  const bad = (why: string) =>
+    new Error(`${path} is corrupt (${why}). Repair it or delete it to create a new device identity.`);
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (e) {
+    throw bad((e as Error).message);
+  }
+  const keys = ["deviceId", "signPub", "signPriv", "boxPub", "boxPriv"] as const;
+  if (!raw || typeof raw !== "object" || keys.some((k) => typeof raw[k] !== "string")) throw bad("missing or non-string fields");
+  const id = raw as unknown as DeviceIdentity;
+  try {
+    if (
+      id.deviceId !== sha256Hex(hexToBytes(id.signPub)).slice(0, 16) ||
+      id.signPub !== bytesToHex(ed25519.getPublicKey(hexToBytes(id.signPriv))) ||
+      id.boxPub !== bytesToHex(x25519.getPublicKey(hexToBytes(id.boxPriv)))
+    ) throw new Error("mismatch");
+  } catch {
+    throw bad("keys do not match");
+  }
+  return id;
+}
+
 /** Read `identity.json` from the mindmeld home, creating it (mode 600) on first use. */
 export function loadOrCreateIdentity(): DeviceIdentity {
   const path = join(homeDir(), "identity.json");
-  if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8")) as DeviceIdentity;
+  if (existsSync(path)) return readIdentity(path);
   const signPriv = ed25519.utils.randomSecretKey();
   const signPub = ed25519.getPublicKey(signPriv);
   const boxPriv = x25519.utils.randomSecretKey();
