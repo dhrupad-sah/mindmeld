@@ -4,12 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-
-// The plugin runs this file directly (no npx download), so it must start on its own.
-const bundle = fileURLToPath(new URL("../plugin/server/mindmeld.cjs", import.meta.url));
+import { bundle, startServer } from "./helpers/mcpserver.js";
 
 describe("plugin bundle", () => {
-  it("exists and serves the MCP tools over stdio", async () => {
+  it("exists and serves the MCP tools over stdio, team tools included", async () => {
     expect(existsSync(bundle)).toBe(true);
     const child = spawn(process.execPath, [bundle, "mcp"], {
       cwd: "/",
@@ -29,31 +27,9 @@ describe("plugin bundle", () => {
     const tools = msgs.find((m) => m.id === 2).result.tools.map((t: { name: string }) => t.name);
     expect(tools).toEqual(expect.arrayContaining(["share_session", "stop_sharing", "status", "ask_peer", "invite_peer", "join_peer"]));
     expect(Date.now() - started).toBeLessThan(3000); // starts fast: nothing to download
+    expect(tools).toEqual(expect.arrayContaining(["login", "create_team", "invite_member", "accept_invite", "team", "remove_member", "set_role"]));
   });
 });
-
-/** Runs the bundled MCP server like Claude Code does, with its own MINDMELD_HOME. */
-function startServer(home: string) {
-  const child = spawn(process.execPath, [bundle, "mcp"], { cwd: "/", env: { ...process.env, MINDMELD_HOME: home } });
-  let out = "";
-  let nextId = 10;
-  child.stdout.on("data", (d) => (out += d));
-  const send = (m: object) => child.stdin.write(JSON.stringify(m) + "\n");
-  const call = async (name: string, args: object = {}) => {
-    const id = nextId++;
-    send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
-    const started = Date.now();
-    while (Date.now() - started < 8000) {
-      const line = out.split("\n").find((l) => l.includes(`"id":${id}`));
-      if (line) return JSON.parse(line).result.content[0].text as string;
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    throw new Error(`no reply to ${name}`);
-  };
-  send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
-  send({ jsonrpc: "2.0", method: "notifications/initialized" });
-  return { call, stop: () => child.kill() };
-}
 
 function pairedHome(): string {
   const home = mkdtempSync(join(tmpdir(), "mindmeld-home-"));

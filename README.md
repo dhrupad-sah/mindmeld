@@ -26,7 +26,28 @@ claude mcp add -s user mindmeld -- mindmeld mcp
 ```
 </details>
 
-## Connect
+## Teams (GitHub sign-in)
+
+A team is a group of people who sign in with GitHub. Each machine gets its own key pair, the team has a roster with admins and members, and an admin can remove someone for real: their devices are cut off and the team key is replaced, so they can't read anything sent afterwards. (Legacy groups below can't do that.) Teams need the hosted relay or your own relay running the 0.6 Worker. To use your own for teams, sign in with `mindmeld login --relay wss://your-relay` (or set `"teamRelay"` in `~/.mindmeld/config.json`); environment variables never change where your GitHub sign-in goes.
+
+1. **Sign in, everyone, once:** `/mindmeld:login`. Claude shows a code and a link. Open the link, enter the code, approve on GitHub. Sign-in finishes on its own and `/mindmeld:status` shows who you are. It lasts 7 days, then you sign in again.
+2. **Create a team (an admin):** `/mindmeld:team create core`. You're its first admin and this machine is connected to it.
+3. **Invite by GitHub username:** `/mindmeld:team invite sarim-dev`. Claude gives you a short message to send them.
+4. **They sign in and accept:** they install the plugin, run `/mindmeld:login`, then `/mindmeld:team accept core`. Their machine gets the team key the next time a teammate is online. `/mindmeld:status` shows "waiting" until then.
+5. **Share a session:** `/mindmeld:share scraper work`, same as before. Sessions stay private until you do this.
+6. **Ask:** *"ask sarim-dev how they got the scraper so fast"*. Approval dialogs, the read-only fork and "always allow" work as described below.
+
+`/mindmeld:team` on its own shows the members, roles, pending invites, and each device's key fingerprint and whether it has the team key. `/mindmeld:team role <login> admin|member` changes a role.
+
+**Removing someone:** `/mindmeld:team remove sarim-dev` (admins only). A dialog asks you to confirm. Then their devices are disconnected right away and the team key is rotated for everyone left. They keep whatever they already received, but not anything sent after.
+
+The relay learns team names, members' GitHub logins, roles, device public keys and who is connected. It never sees team keys or message content. One thing to know: the relay hands out the public keys, so a malicious relay could swap one. If that matters to you, compare fingerprints from `/mindmeld:team` with your teammates over another channel. Details, constructions and known gaps are in [`docs/security.md`](docs/security.md); it has not had an outside review yet.
+
+## Legacy groups (invite codes)
+
+Groups paired with an invite code still work and are unchanged. They have no accounts: everyone shares one secret, and names aren't verified.
+
+### Connecting a legacy group
 
 - **You:** `/mindmeld:invite` (or just say *"invite a teammate to mindmeld"*). Claude gives you a code like `k7q2-9xmd-4tpa` and a message to send. The code works once and expires in 15 minutes.
 - **Them:** `/mindmeld:join k7q2-9xmd-4tpa`. Connected.
@@ -88,9 +109,11 @@ mindmeld relay                  # self-host a relay
 
 ## Relay
 
-By default, both sides connect to a hosted relay (a Cloudflare Worker, source in [`relay-worker/`](relay-worker/)). It only passes along encrypted frames and stores nothing. To run your own, use `mindmeld relay --port 8787` on any reachable machine, or deploy `relay-worker/` to your own Cloudflare account. Then pass `--relay ws://host:8787` to `pair` and `join`, or set `MINDMELD_RELAY`.
+By default, both sides connect to a hosted relay (a Cloudflare Worker, source in [`relay-worker/`](relay-worker/)). It only passes along encrypted frames and stores nothing. To run your own, use `mindmeld relay --port 8787` on any reachable machine, or deploy `relay-worker/` to your own Cloudflare account. Then pass `--relay ws://host:8787` to `pair` and `join`, or set `MINDMELD_RELAY` (invite-code groups only; teams use `mindmeld login --relay`, see above).
 
 ## Safety model
+
+This section describes legacy groups. For teams, see [`docs/security.md`](docs/security.md).
 
 - **Pairing via a PAKE handshake.** Invite codes run SPAKE2 over ristretto255. The relay sees only the first 4 characters (a rendezvous id), never the password part. Someone watching, including the relay operator, can't guess the code offline. An attacker gets one live guess, and a wrong guess burns the invite.
 - **End-to-end encrypted.** Pairing hands each member a random 256-bit group secret. Every message is sealed with AES-256-GCM using a key derived from that secret. The relay only sees a room hash and ciphertext, and stores nothing.

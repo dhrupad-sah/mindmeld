@@ -1,6 +1,6 @@
 {
   "name": "mindmeld-mcp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "mindmeld: let your Claude Code session ask a teammate's Claude Code session questions. E2E encrypted, read-only answers, approved in Claude.",
   "type": "module",
   "license": "MIT",
@@ -34,7 +34,8 @@
     "@types/ws": "^8.18.2",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.12"
+    "vitest": "^4.1.12",
+    "wrangler": "^4.153.0"
   },
   "keywords": [
     "mindmeld",

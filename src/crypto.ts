@@ -43,26 +43,42 @@ export function keyFor(secret: string): Buffer {
   return Buffer.from(hkdfSync("sha256", Buffer.from(secret, "hex"), "claude-share/salt", "claude-share/key", 32));
 }
 
-/** AES-256-GCM; output is base64(nonce | ciphertext | tag). */
-export function seal(key: Uint8Array, plaintext: string): string {
+/**
+ * AES-256-GCM over raw bytes with a fresh random 96-bit nonce per call; output is nonce | ciphertext | tag.
+ * When `aad` is given it is authenticated (not encrypted); omitting it sets no AAD at all.
+ */
+export function sealBytes(key: Uint8Array, plaintext: Uint8Array, aad?: Uint8Array): Buffer {
   const nonce = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, nonce);
-  const body = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  return Buffer.concat([nonce, body, cipher.getAuthTag()]).toString("base64");
+  if (aad) cipher.setAAD(aad);
+  const body = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return Buffer.concat([nonce, body, cipher.getAuthTag()]);
 }
 
-/** Returns null if the frame was not sealed with this key or was tampered with. */
-export function open(key: Uint8Array, sealed: string): string | null {
+/** Inverse of `sealBytes`; null if the key, AAD or bytes do not authenticate. Never throws. */
+export function openBytes(key: Uint8Array, sealed: Uint8Array, aad?: Uint8Array): Buffer | null {
   try {
-    const buf = Buffer.from(sealed, "base64");
+    const buf = Buffer.from(sealed.buffer, sealed.byteOffset, sealed.byteLength);
     if (buf.length < 28) return null;
     const nonce = buf.subarray(0, 12);
     const tag = buf.subarray(buf.length - 16);
     const body = buf.subarray(12, buf.length - 16);
     const decipher = createDecipheriv("aes-256-gcm", key, nonce);
+    if (aad) decipher.setAAD(aad);
     decipher.setAuthTag(tag);
-    return Buffer.concat([decipher.update(body), decipher.final()]).toString("utf8");
+    return Buffer.concat([decipher.update(body), decipher.final()]);
   } catch {
     return null;
   }
+}
+
+/** AES-256-GCM; output is base64(nonce | ciphertext | tag). Optional `aad` is utf8-encoded and authenticated. */
+export function seal(key: Uint8Array, plaintext: string, aad?: string): string {
+  return sealBytes(key, Buffer.from(plaintext, "utf8"), aad === undefined ? undefined : Buffer.from(aad, "utf8")).toString("base64");
+}
+
+/** Returns null if the frame was not sealed with this key (and `aad`, if given) or was tampered with. */
+export function open(key: Uint8Array, sealed: string, aad?: string): string | null {
+  const out = openBytes(key, Buffer.from(sealed, "base64"), aad === undefined ? undefined : Buffer.from(aad, "utf8"));
+  return out === null ? null : out.toString("utf8");
 }
