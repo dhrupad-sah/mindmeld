@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { loadSession, type Session } from "./auth/session.js";
 import type { Channel } from "./channel.js";
-import { DEFAULT_RELAY, relayWarning, saveConfig, withTeam, type Config } from "./config.js";
+import { DEFAULT_RELAY, relayWarning, saveConfig, teamRelay, withTeam, type Config } from "./config.js";
 import { loadOrCreateIdentity } from "./identity.js";
 import {
   acceptInvite,
@@ -63,10 +63,10 @@ export function setupTeams(host: TeamHost) {
   function ready(needTeam: false): Ready | string;
   function ready(needTeam: true): ReadyTeam | string;
   function ready(needTeam: boolean): Ready | ReadyTeam | string {
-    const s = signInState();
-    if (!("session" in s)) return signInLine(s);
     const config = host.loadConfig();
-    const relay = config?.relay ?? DEFAULT_RELAY;
+    const relay = teamRelay(config);
+    const s = signInState(relay);
+    if (!("session" in s)) return signInLine(s);
     if (!needTeam) return { session: s.session, config, relay };
     if (!config?.team) return NO_TEAM;
     return { session: s.session, config, relay, team: config.team };
@@ -89,15 +89,16 @@ export function setupTeams(host: TeamHost) {
     channel = null;
     channelExpired = false;
     if (!config.team) return { name: config.name };
-    const session = loadSession();
+    const relay = teamRelay(config);
+    const session = loadSession(relay);
     if (!session) return null;
-    const ch = new TeamChannel({ relayHttp: config.relay, teamId: config.team.teamId, session, id: loadOrCreateIdentity() });
+    const ch = new TeamChannel({ relayHttp: relay, teamId: config.team.teamId, session, id: loadOrCreateIdentity() });
     ch.on("auth-expired", () => {
       if (channel === ch) channelExpired = true;
     });
     channel = ch;
     // A second machine for the same login: add this device (a no-op when the team already has it).
-    addDevice(config.relay, session, config.team.teamId).catch(() => {});
+    addDevice(relay, session, config.team.teamId).catch(() => {});
     return { channel: ch, name: session.login };
   }
 
@@ -105,7 +106,7 @@ export function setupTeams(host: TeamHost) {
   function blocker(): string | null {
     const config = host.loadConfig();
     if (!config?.team) return null;
-    const s = signInState();
+    const s = signInState(teamRelay(config));
     if (!("session" in s)) return signInLine(s);
     if (channelExpired) return SIGNED_IN_EXPIRED;
     if (channel && !channel.connected && channel.status) return `Not connected to team "${config.team.name}": ${channel.status}`;
@@ -114,7 +115,8 @@ export function setupTeams(host: TeamHost) {
 
   /** Lines for the status tool: sign-in, team and role, and the team connection's problem if any. */
   async function statusLines(config: Config | null): Promise<string[]> {
-    const s = signInState();
+    const relayUrl = teamRelay(config);
+    const s = signInState(relayUrl);
     let signedIn = signInLine(s);
     const lines: string[] = [];
     let teamText: string | null = null;
@@ -123,7 +125,7 @@ export function setupTeams(host: TeamHost) {
       let failed = "";
       if ("session" in s && !channelExpired) {
         try {
-          roster = await getRoster(config.relay, s.session, config.team.teamId, 3000);
+          roster = await getRoster(relayUrl, s.session, config.team.teamId, 3000);
         } catch (e) {
           if ((e as { status?: number }).status === 401) channelExpired = true;
           else failed = ` (couldn't load the roster: ${(e as Error).message})`;
@@ -132,7 +134,8 @@ export function setupTeams(host: TeamHost) {
       if (channelExpired) signedIn = SIGNED_IN_EXPIRED;
       teamText = teamLine(config.team.name, roster, "session" in s ? s.session.login : null) + failed;
     }
-    const relay = relayWarning(config?.relay ?? DEFAULT_RELAY);
+    // The relay in use: the legacy group's when only a group is set, else the team relay.
+    const relay = relayWarning(config?.secret && !config.team ? config.relay : relayUrl);
     if (relay) lines.push(relay);
     lines.push(signedIn);
     if (login.pending && !("session" in s)) lines.push("Sign-in in progress: waiting for the code to be entered on GitHub");
@@ -144,7 +147,8 @@ export function setupTeams(host: TeamHost) {
   }
 
   /** What the config watcher compares: a change means reconnect. Includes the session for a team. */
-  const watchKey = (c: Config | null) => [c?.secret ?? "", c?.team?.teamId ?? "", c?.team ? (loadSession()?.token ?? "") : ""].join("|");
+  const watchKey = (c: Config | null) =>
+    [c?.secret ?? "", c?.team?.teamId ?? "", teamRelay(c), c?.team ? (loadSession(teamRelay(c))?.token ?? "") : ""].join("|");
 
   /**
    * Point config.json at `team`, keeping everything else except the always-allow list when the team
@@ -152,7 +156,7 @@ export function setupTeams(host: TeamHost) {
    */
   function useTeam(r: Ready, team: { teamId: string; name: string }): string {
     const prev = r.config;
-    saveConfig(withTeam(prev, { relay: r.relay, name: prev?.name ?? r.session.login }, team));
+    saveConfig(withTeam(prev, { relay: prev?.relay ?? DEFAULT_RELAY, name: prev?.name ?? r.session.login }, team));
     host.reconnect();
     return prev?.team && prev.team.teamId !== team.teamId ? ` (This replaced team "${prev.team.name}" on this machine.)` : "";
   }
@@ -167,12 +171,13 @@ export function setupTeams(host: TeamHost) {
       inputSchema: {},
     },
     async () => {
-      const relay = host.loadConfig()?.relay ?? DEFAULT_RELAY;
+      const config = host.loadConfig();
+      const relay = teamRelay(config);
       const gen = login.gen + 1;
       login = { gen, pending: true, error: null };
       return new Promise<ReturnType<typeof text>>((resolve) => {
         let shown = false;
-        signIn(relay, (code, uri) => {
+        signIn(relay, config, (code, uri) => {
           shown = true;
           resolve(
             text(

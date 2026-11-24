@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
-import type { Session } from "./auth/session.js";
+import { assertSessionRelay, type Session } from "./auth/session.js";
+import { httpBase } from "./config.js";
 import type { DeviceIdentity } from "./identity.js";
 import { openFromDevice, sealToDevice } from "./teamcrypto.js";
 
@@ -113,11 +114,12 @@ export function verifyTeamKeys(
   return { epoch: typeof body?.epoch === "number" ? body.epoch : 0, keys, problems };
 }
 
-/** http(s) base URL of the relay, no trailing slash; ws(s):// is mapped to http(s)://. */
-export const httpBase = (relay: string) => relay.replace(/^ws(s?):\/\//, "http$1://").replace(/\/+$/, "");
+export { httpBase };
 
-async function getJson(url: string, session: Session): Promise<unknown> {
-  const res = await fetch(url, { headers: { authorization: `Bearer ${session.token}` } });
+/** GET `path` on the relay as `session` (only the relay that issued the session). */
+async function getJson(relayHttp: string, path: string, session: Session): Promise<unknown> {
+  assertSessionRelay(relayHttp, session);
+  const res = await fetch(`${httpBase(relayHttp)}${path}`, { headers: { authorization: `Bearer ${session.token}` } });
   let body: unknown = null;
   try {
     body = await res.json();
@@ -131,7 +133,7 @@ async function getJson(url: string, session: Session): Promise<unknown> {
 
 /** GET /v1/teams/:id: the team roster (members only). Throws on an HTTP error (`status` on the error). */
 export async function fetchRoster(relayHttp: string, teamId: string, session: Session): Promise<TeamRoster> {
-  const r = (await getJson(`${httpBase(relayHttp)}/v1/teams/${teamId}`, session)) as TeamRoster;
+  const r = (await getJson(relayHttp, `/v1/teams/${teamId}`, session)) as TeamRoster;
   if (!r || !Array.isArray(r.members) || typeof r.epoch !== "number") throw new Error("relay: unexpected roster response");
   return r;
 }
@@ -141,7 +143,7 @@ export async function fetchRoster(relayHttp: string, teamId: string, session: Se
  * Throws on an HTTP error; verification failures are reported in `problems`, not thrown.
  */
 export async function fetchTeamKeys(relayHttp: string, teamId: string, session: Session, id: DeviceIdentity, roster: TeamRoster): Promise<VerifiedKeys> {
-  const body = (await getJson(`${httpBase(relayHttp)}/v1/teams/${teamId}/keys`, session)) as { epoch: number; epochs: Record<string, WrapEntry> };
+  const body = (await getJson(relayHttp, `/v1/teams/${teamId}/keys`, session)) as { epoch: number; epochs: Record<string, WrapEntry> };
   return verifyTeamKeys(teamId, id, roster, body);
 }
 
@@ -186,6 +188,7 @@ export function epochCommit(signer: DeviceIdentity, teamId: string, epoch: numbe
 
 /** PUT /v1/teams/:id/keys. Throws on an HTTP error (`status` on the error). */
 async function putKeys(o: TeamKeyOptions, body: { epoch: number; wrapped: Record<string, { sealed: string; sig: string }>; commit?: { hash: string; sig: string } }): Promise<void> {
+  assertSessionRelay(o.relayHttp, o.session);
   const res = await fetch(`${httpBase(o.relayHttp)}/v1/teams/${o.teamId}/keys`, {
     method: "PUT",
     headers: { authorization: `Bearer ${o.session.token}`, "content-type": "application/json" },

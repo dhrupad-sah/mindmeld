@@ -1,6 +1,7 @@
 import { deviceFlowLogin } from "./auth/github.js";
 import { GITHUB_CLIENT_ID } from "./auth/config.js";
-import { exchange, loadSession, savedSessionLogin, type Session } from "./auth/session.js";
+import { assertSessionRelay, exchange, loadSession, savedSessionLogin, type Session } from "./auth/session.js";
+import { credentialRelayAllowed, type Config } from "./config.js";
 import { fingerprint, loadOrCreateIdentity } from "./identity.js";
 import { httpBase, type TeamRoster } from "./teamkeys.js";
 
@@ -16,17 +17,20 @@ export const INSTALL = "claude plugin install mindmeld --marketplace dhrupad-sah
 /** GitHub logins are case-insensitive; mindmeld compares and sends them lowercased. */
 export const normLogin = (login: string) => login.trim().replace(/^@/, "").toLowerCase();
 
-/** The saved session, or why there is none: never signed in, or signed in but expired. */
+/**
+ * The saved session for `relay`, or why there is none: never signed in (or signed in at another
+ * relay), or signed in but expired.
+ */
 export type SignIn = { session: Session } | { expired: string } | { none: true };
-export function signInState(): SignIn {
-  const session = loadSession();
+export function signInState(relay: string): SignIn {
+  const session = loadSession(relay);
   if (session) return { session };
-  const login = savedSessionLogin();
+  const login = savedSessionLogin(relay);
   return login ? { expired: login } : { none: true };
 }
 
 /** "Signed in: @x", or the guidance to sign in. */
-export function signInLine(s: SignIn = signInState()): string {
+export function signInLine(s: SignIn): string {
   if ("session" in s) return `Signed in: @${s.session.login}`;
   return "expired" in s ? SIGNED_IN_EXPIRED : NOT_SIGNED_IN;
 }
@@ -43,6 +47,12 @@ export class TeamApiError extends Error {
 
 /** One call to a team route as `session`. A 401 becomes the sign-in guidance. */
 export async function teamCall<T = unknown>(relay: string, session: Session, method: string, path: string, body?: unknown, timeoutMs = 15_000): Promise<T> {
+  // The session token only ever goes to the relay that issued it.
+  try {
+    assertSessionRelay(relay, session);
+  } catch (e) {
+    throw new TeamApiError((e as Error).message, 401);
+  }
   const res = await fetch(`${httpBase(relay)}${path}`, {
     method,
     headers: { authorization: `Bearer ${session.token}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
@@ -92,10 +102,14 @@ export function githubBase(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /**
- * GitHub device-flow sign-in, then the exchange for a relay session (saved to session.json).
- * `onCode` gets the code to show the user.
+ * GitHub device-flow sign-in, then the exchange for a relay session (saved to session.json, bound
+ * to `relay`). `onCode` gets the code to show the user. Refuses, before asking GitHub, a relay that
+ * is not the hosted one, a loopback one, or the team relay the user chose in `config`.
  */
-export async function signIn(relay: string, onCode: (userCode: string, verificationUri: string) => void): Promise<Session> {
+export async function signIn(relay: string, config: Config | null, onCode: (userCode: string, verificationUri: string) => void): Promise<Session> {
+  if (!credentialRelayAllowed(relay, config)) {
+    throw new Error(`refusing to sign in at ${relay}: choose it explicitly with mindmeld login --relay ${relay}`);
+  }
   const token = await deviceFlowLogin({ clientId: GITHUB_CLIENT_ID, onCode, githubBase: githubBase() });
   return exchange(relay, token, loadOrCreateIdentity());
 }

@@ -2,14 +2,18 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
-import { homeDir } from "../config.js";
+import { homeDir, httpBase, sameRelay } from "../config.js";
 import type { DeviceIdentity } from "../identity.js";
 
-/** A mindmeld relay session. `expiresAt` is unix time in seconds (same unit as the token's `exp`). */
+/**
+ * A mindmeld relay session. `expiresAt` is unix time in seconds (same unit as the token's `exp`).
+ * `relay` is the http(s) base of the relay that issued it: the token is only ever sent there.
+ */
 export interface Session {
   login: string;
   token: string;
   expiresAt: number;
+  relay: string;
 }
 
 const sessionPath = () => join(homeDir(), "session.json");
@@ -17,7 +21,7 @@ const sessionPath = () => join(homeDir(), "session.json");
 function isSession(v: unknown): v is Session {
   if (!v || typeof v !== "object") return false;
   const s = v as Record<string, unknown>;
-  return typeof s.login === "string" && typeof s.token === "string" && typeof s.expiresAt === "number";
+  return typeof s.login === "string" && typeof s.token === "string" && typeof s.expiresAt === "number" && typeof s.relay === "string";
 }
 
 function saveSession(s: Session): void {
@@ -56,7 +60,7 @@ async function postJson(url: string, payload?: unknown): Promise<unknown> {
  * Saves the session to `session.json` (mode 600). The GitHub token itself is not stored.
  */
 export async function exchange(relayHttp: string, githubToken: string, id: DeviceIdentity): Promise<Session> {
-  const base = relayHttp.replace(/^ws(s?):\/\//, "http$1://").replace(/\/+$/, "");
+  const base = httpBase(relayHttp);
   const ch = await postJson(`${base}/v1/auth/challenge`);
   const nonce = (ch as { nonce?: unknown } | null)?.nonce;
   if (typeof nonce !== "string" || !/^[0-9a-f]+$/.test(nonce)) throw new Error("relay sign-in: unexpected challenge response");
@@ -67,30 +71,44 @@ export async function exchange(relayHttp: string, githubToken: string, id: Devic
     nonce,
     proof,
   });
-  if (!isSession(body)) throw new Error("relay sign-in: unexpected response");
-  const session: Session = { login: body.login, token: body.token, expiresAt: body.expiresAt };
+  const b = body as Record<string, unknown> | null;
+  if (!b || typeof b.login !== "string" || typeof b.token !== "string" || typeof b.expiresAt !== "number") throw new Error("relay sign-in: unexpected response");
+  const session: Session = { login: b.login, token: b.token, expiresAt: b.expiresAt, relay: base };
   saveSession(session);
   return session;
 }
 
-/** The saved session, or null if there is none, it is unreadable, or it has expired. */
-export function loadSession(): Session | null {
+/**
+ * The saved session for `relay`, or null if there is none, it is unreadable, it has expired, or it
+ * was issued by a different relay (a session is never sent anywhere but the relay that issued it).
+ */
+export function loadSession(relay: string): Session | null {
   let s: unknown;
   try {
     s = JSON.parse(readFileSync(sessionPath(), "utf8"));
   } catch {
     return null;
   }
-  if (!isSession(s) || s.expiresAt <= Date.now() / 1000) return null;
-  return { login: s.login, token: s.token, expiresAt: s.expiresAt };
+  if (!isSession(s) || s.expiresAt <= Date.now() / 1000 || !sameRelay(s.relay, relay)) return null;
+  return { login: s.login, token: s.token, expiresAt: s.expiresAt, relay: s.relay };
 }
 
-/** Login of the saved session even if it has expired (null if there is none), to tell "expired" from "never signed in". */
-export function savedSessionLogin(): string | null {
+/**
+ * Login of the saved session for `relay` even if it has expired (null if there is none, or it is for
+ * another relay), to tell "expired" from "never signed in".
+ */
+export function savedSessionLogin(relay: string): string | null {
   try {
     const s: unknown = JSON.parse(readFileSync(sessionPath(), "utf8"));
-    return isSession(s) ? s.login : null;
+    return isSession(s) && sameRelay(s.relay, relay) ? s.login : null;
   } catch {
     return null;
+  }
+}
+
+/** Throws unless `session` was issued by `relay`: call before sending its token anywhere. */
+export function assertSessionRelay(relay: string, session: Session): void {
+  if (!session.relay || !sameRelay(relay, session.relay)) {
+    throw Object.assign(new Error("signed in at a different relay: run /mindmeld:login"), { status: 401 });
   }
 }

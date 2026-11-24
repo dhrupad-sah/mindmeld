@@ -4,7 +4,7 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { answerWithFork } from "./answerer.js";
 import { generateGroupSecret, generateInviteCode } from "./crypto.js";
-import { DEFAULT_RELAY, defaultName, deleteConfig, loadConfig, saveConfig, withTeam, type Config } from "./config.js";
+import { DEFAULT_RELAY, defaultName, deleteConfig, loadConfig, saveConfig, teamRelay, withTeam, type Config } from "./config.js";
 import { Daemon, type Decide, type Decision } from "./daemon.js";
 import { runMcpServer, teamLeaveNote, teamSetNote } from "./mcp.js";
 import { runInviter, runJoiner } from "./pairing.js";
@@ -40,7 +40,8 @@ const USAGE = `mindmeld — let teammates' Claude Code sessions ask each other q
   mindmeld up    [--session <id|latest>] [--auto-approve]
                                                        run the daemon (in your project dir)
   mindmeld leave     [-y]                             leave your group (disconnects every session here)
-  mindmeld login                                   sign in with GitHub (needed for teams)
+  mindmeld login [--relay wss://…]                 sign in with GitHub (needed for teams); --relay picks
+                                                       the team relay (default: the hosted one)
   mindmeld team                                    show your team: members, devices, invites, activity
   mindmeld team create <name>                      create a team (you're its admin)
   mindmeld team invite <github-login>              invite someone (admins)
@@ -118,7 +119,7 @@ async function main() {
     }
     case "leave": {
       const current = loadConfigOrNull();
-      if (!current) {
+      if (!current || (!current.secret && !current.team)) {
         console.log("You're not in a mindmeld group.");
         return;
       }
@@ -143,8 +144,14 @@ async function main() {
       return;
     }
     case "login": {
-      const relay = loadConfigOrNull()?.relay ?? DEFAULT_RELAY;
-      const session = await signIn(relay, (code, uri) => {
+      let config = loadConfigOrNull();
+      if (values.relay) {
+        // An explicit choice: team sign-in and team calls go to this relay from now on.
+        config = { ...(config ?? { relay: DEFAULT_RELAY, name: defaultName() }), teamRelay: values.relay };
+        saveConfig(config);
+      }
+      const relay = teamRelay(config);
+      const session = await signIn(relay, config, (code, uri) => {
         console.log(`Open ${bold(uri)} and enter ${bold(code)}`);
         console.log(dim("waiting for you to approve on GitHub…"));
       });
@@ -172,12 +179,13 @@ async function main() {
 /** `mindmeld team [create|invite|accept|remove|role]`: the CLI side of the MCP team tools. */
 async function team(args: string[], yes: boolean): Promise<void> {
   const [sub, a, b] = args;
-  const s = signInState();
+  const config = loadConfigOrNull();
+  const relay = teamRelay(config);
+  const s = signInState(relay);
   if (!("session" in s)) throw new Error(`${signInLine(s)} (or: mindmeld login)`);
   const session = s.session;
-  const config = loadConfigOrNull();
-  const relay = config?.relay ?? DEFAULT_RELAY;
-  const useTeam = (t: { teamId: string; name: string }) => saveConfig(withTeam(config, { relay, name: config?.name ?? session.login }, t));
+  const useTeam = (t: { teamId: string; name: string }) =>
+    saveConfig(withTeam(config, { relay: config?.relay ?? DEFAULT_RELAY, name: config?.name ?? session.login }, t));
   const current = () => {
     if (!config?.team) throw new Error("you're not in a team yet: mindmeld team create <name>, or mindmeld team accept");
     return config.team;
@@ -296,7 +304,7 @@ function sessionForQuestion(cwd: string, pinned: string | null): SessionInfo | {
 
 async function up(autoApprove: boolean, sessionFlag: string | undefined) {
   const config = loadConfig();
-  if (!config) throw new Error("not paired yet: run `mindmeld pair` or `mindmeld join <code>` first");
+  if (!config || (!config.secret && !config.team)) throw new Error("not paired yet: run `mindmeld pair` or `mindmeld join <code>` first");
   const cwd = process.cwd();
   const interactive = Boolean(process.stdin.isTTY);
   if (!interactive && !autoApprove) {
@@ -316,15 +324,16 @@ async function up(autoApprove: boolean, sessionFlag: string | undefined) {
   let name = config.name;
   let channel: TeamChannel | undefined;
   if (config.team) {
-    const session = loadSession();
-    if (!session) throw new Error(`${signInLine()} (or: mindmeld login)`);
-    channel = new TeamChannel({ relayHttp: config.relay, teamId: config.team.teamId, session, id: loadOrCreateIdentity() });
+    const relay = teamRelay(config);
+    const session = loadSession(relay);
+    if (!session) throw new Error(`${signInLine(signInState(relay))} (or: mindmeld login)`);
+    channel = new TeamChannel({ relayHttp: relay, teamId: config.team.teamId, session, id: loadOrCreateIdentity() });
     channel.on("status", (why: string | null) => why && console.log(dim(`team: ${why}`)));
-    addDevice(config.relay, session, config.team.teamId).catch(() => {}); // a second machine joins its login's team
+    addDevice(relay, session, config.team.teamId).catch(() => {}); // a second machine joins its login's team
     name = session.login;
   }
   const daemon = new Daemon({ ...config, name, channel, project: basename(cwd), decide });
-  daemon.on("connected", () => console.log(dim(`connected to relay ${config.relay}`)));
+  daemon.on("connected", () => console.log(dim(`connected to relay ${config.team ? teamRelay(config) : config.relay}`)));
   daemon.on("disconnected", () => console.log(dim("relay connection lost, reconnecting…")));
   daemon.on("relay-error", (e: NodeJS.ErrnoException) => console.log(dim(`relay error: ${e.message || e.code || "connection failed"}`)));
   daemon.on("peer-joined", (p) => console.log(`${cyan("●")} ${p.name} is online (${p.project})`));

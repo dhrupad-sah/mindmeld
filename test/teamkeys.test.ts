@@ -129,7 +129,7 @@ describe("key distribution and rotation", () => {
 
   let n = 0;
   const user = (base: string) => signInTestUser(relay, `${base}${++n}`);
-  const session = (u: TestUser) => ({ login: u.login, token: u.token, expiresAt: Date.now() / 1000 + 3600 });
+  const session = (u: TestUser) => ({ login: u.login, token: u.token, expiresAt: Date.now() / 1000 + 3600, relay: relay.url });
   const opts = (u: TestUser, teamId: string) => ({ relayHttp: relay.url, teamId, session: session(u), id: u.id });
   const call = async (u: TestUser, method: string, path: string, body?: unknown, status = 200) => {
     const res = await fetch(`${relay.url}${path}`, {

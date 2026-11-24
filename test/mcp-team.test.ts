@@ -31,6 +31,8 @@ describe("team tools over MCP", () => {
   /** A fresh mindmeld home; signed in as `login` against the test relay when given. */
   async function home(login?: string): Promise<{ dir: string; id?: DeviceIdentity }> {
     const dir = mkdtempSync(join(tmpdir(), "mindmeld-team-home-"));
+    // Team sign-in goes only to a relay the user chose, never one from the environment.
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ relay: relay.wsUrl, name: "x", teamRelay: relay.url }));
     if (!login) return { dir };
     const prev = process.env.MINDMELD_HOME;
     process.env.MINDMELD_HOME = dir;
@@ -44,7 +46,7 @@ describe("team tools over MCP", () => {
     }
   }
   function server(dir: string, opts: Parameters<typeof startServer>[2] = {}) {
-    const s = startServer(dir, { MINDMELD_RELAY: relay.url, MINDMELD_GITHUB_BASE: relay.github.url }, opts);
+    const s = startServer(dir, { MINDMELD_GITHUB_BASE: relay.github.url }, opts);
     stops.push(s.stop);
     return s;
   }
@@ -180,7 +182,7 @@ describe("team tools over MCP", () => {
   it("leave_group always asks in a dialog when it can, even with confirmed: true", async () => {
     const { dir } = await home();
     const configPath = join(dir, "config.json");
-    writeFileSync(configPath, JSON.stringify({ secret: "cd".repeat(32), relay: relay.wsUrl, name: "erin" }));
+    writeFileSync(configPath, JSON.stringify({ secret: "cd".repeat(32), relay: relay.wsUrl, name: "erin", teamRelay: relay.url }));
     const s = server(dir, { elicit: "decline" });
     expect(await s.call("leave_group", { confirmed: true })).toContain("staying in the group");
     expect(s.dialogs).toHaveLength(1);
@@ -195,7 +197,7 @@ describe("team tools over MCP", () => {
     const b = await home(bob);
     // Names trusted in a legacy group must not carry over to GitHub logins.
     for (const h of [a, b]) {
-      writeFileSync(join(h.dir, "config.json"), JSON.stringify({ secret: "ef".repeat(32), relay: relay.wsUrl, name: "x", trusted: [bob, alice, "mallory"] }));
+      writeFileSync(join(h.dir, "config.json"), JSON.stringify({ secret: "ef".repeat(32), relay: relay.wsUrl, name: "x", teamRelay: relay.url, trusted: [bob, alice, "mallory"] }));
     }
     const sa = server(a.dir);
     expect(await sa.call("create_team", { name: "core" })).toContain("Created team");
@@ -210,7 +212,7 @@ describe("team tools over MCP", () => {
   it("join_peer and invite_peer refuse while a team is set, and change nothing", async () => {
     const { dir } = await home();
     const configPath = join(dir, "config.json");
-    const before = JSON.stringify({ relay: relay.wsUrl, name: "erin", team: { teamId: "0123456789abcdef", name: "core" } });
+    const before = JSON.stringify({ relay: relay.wsUrl, name: "erin", teamRelay: relay.url, team: { teamId: "0123456789abcdef", name: "core" } });
     writeFileSync(configPath, before);
     const s = server(dir);
     for (const [tool, args] of [["join_peer", { code: "k7q2-9xmd-4tpa" }], ["invite_peer", {}]] as const) {
@@ -223,8 +225,8 @@ describe("team tools over MCP", () => {
 
   it("an expired sign-in says so in status and in other tools", async () => {
     const { dir } = await home();
-    writeFileSync(join(dir, "session.json"), JSON.stringify({ login: "erin", token: "t", expiresAt: Math.floor(Date.now() / 1000) - 60 }));
-    writeFileSync(join(dir, "config.json"), JSON.stringify({ relay: relay.url, name: "erin", team: { teamId: "0123456789abcdef", name: "core" } }));
+    writeFileSync(join(dir, "session.json"), JSON.stringify({ login: "erin", token: "t", expiresAt: Math.floor(Date.now() / 1000) - 60, relay: relay.url }));
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ relay: relay.url, name: "erin", teamRelay: relay.url, team: { teamId: "0123456789abcdef", name: "core" } }));
     const s = server(dir);
     const st = await s.call("status");
     expect(st).toContain("Sign-in expired: run /mindmeld:login");

@@ -161,6 +161,7 @@ export async function runMcpServer(): Promise<void> {
   function connect(config: Config) {
     void daemon?.stop();
     daemon = null;
+    if (!config.secret && !config.team) return; // e.g. only a team relay chosen: nobody to connect to
     const how = teams.channelFor(config);
     if (!how) return; // in a team but not signed in: status and the tools say so
     daemon = new Daemon({
@@ -411,7 +412,7 @@ export async function runMcpServer(): Promise<void> {
     },
     async ({ confirmed }) => {
       const current = loadConfigOrNull();
-      if (!current) return text("You're not in a mindmeld group.");
+      if (!current || (!current.secret && !current.team)) return text("You're not in a mindmeld group.");
       if (current.team && !current.secret) return text(teamLeaveNote(current.team.name, false));
       // The user confirms in a dialog whenever the client can show one; `confirmed` can't skip it.
       if (!server.server.getClientCapabilities()?.elicitation) {

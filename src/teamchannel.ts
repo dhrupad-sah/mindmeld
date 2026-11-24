@@ -3,6 +3,7 @@ import WebSocket from "ws";
 import { z } from "zod";
 import type { Session } from "./auth/session.js";
 import type { Channel, PayloadSender, ServerInfo } from "./channel.js";
+import { sameRelay } from "./config.js";
 import type { DeviceIdentity } from "./identity.js";
 import { Payload, PING_INTERVAL_MS } from "./protocol.js";
 import { openFrame, sealFrame, type TeamFrame } from "./teamcrypto.js";
@@ -244,7 +245,8 @@ export class TeamChannel extends EventEmitter implements Channel {
 
   private async connect(): Promise<void> {
     if (this.stopped) return;
-    if (!this.opts.session.token || this.opts.session.expiresAt <= Date.now() / 1000) {
+    // The token only ever goes to the relay that issued it.
+    if (!this.opts.session.token || this.opts.session.expiresAt <= Date.now() / 1000 || !sameRelay(this.opts.relayHttp, this.opts.session.relay ?? "")) {
       return this.terminal(TEAM_CLOSE.signedOut, SIGN_IN_EXPIRED);
     }
     try {

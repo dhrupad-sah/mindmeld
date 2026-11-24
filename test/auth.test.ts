@@ -64,15 +64,16 @@ describe("sign-in", () => {
     const gh = relay.github.addUser("octocat");
     const session = await exchange(relay.url, gh, id);
     expect(session.login).toBe("octocat");
+    expect(session.relay).toBe(relay.url);
     expect(session.expiresAt).toBeGreaterThan(Date.now() / 1000 + 6 * 86400);
     const res = await me(session.token);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ login: "octocat", deviceId: id.deviceId });
     // Stored, mode 600, and loadable; the GitHub token is not kept.
-    expect(loadSession()).toEqual(session);
+    expect(loadSession(relay.url)).toEqual(session);
     const file = join(dir, "session.json");
     if (process.platform !== "win32") expect(statSync(file).mode & 0o777).toBe(0o600);
-    expect(JSON.stringify(loadSession())).not.toContain(gh);
+    expect(JSON.stringify(loadSession(relay.url))).not.toContain(gh);
   });
 
   it("bad github token is rejected with 401", async () => {
@@ -81,7 +82,7 @@ describe("sign-in", () => {
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "github sign-in failed" });
     await expect(exchange(relay.url, "gho_nope", id)).rejects.toThrow(/github sign-in failed/);
-    expect(loadSession()).toBeNull();
+    expect(loadSession(relay.url)).toBeNull();
   });
 
   it("expired token is refused", async () => {
@@ -219,9 +220,9 @@ describe("sign-in", () => {
   it("loadSession returns null when expired", async () => {
     const id = loadOrCreateIdentity();
     await exchange(relay.url, relay.github.addUser("octocat"), id);
-    expect(loadSession()).not.toBeNull();
+    expect(loadSession(relay.url)).not.toBeNull();
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.now() + 8 * 86400 * 1000);
-    expect(loadSession()).toBeNull();
+    expect(loadSession(relay.url)).toBeNull();
   });
 });

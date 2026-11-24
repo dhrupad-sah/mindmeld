@@ -34,7 +34,7 @@ describe("team channel", () => {
 
   let n = 0;
   const user = (base: string) => signInTestUser(relay, `${base}${++n}`);
-  const session = (u: TestUser) => ({ login: u.login, token: u.token, expiresAt: Date.now() / 1000 + 3600 });
+  const session = (u: TestUser) => ({ login: u.login, token: u.token, expiresAt: Date.now() / 1000 + 3600, relay: relay.url });
   const call = async (u: TestUser, method: string, path: string, body?: unknown) => {
     const res = await fetch(`${relay.url}${path}`, {
       method,
@@ -283,7 +283,7 @@ describe("team channel", () => {
     const alice = await user("alice");
     const { teamId } = await team(alice, [], [alice]);
     const fetches = countFetches(teamId);
-    const a = channel(alice, teamId, { session: { login: alice.login, token: "not-a-token", expiresAt: Date.now() / 1000 + 3600 } });
+    const a = channel(alice, teamId, { session: { login: alice.login, token: "not-a-token", expiresAt: Date.now() / 1000 + 3600, relay: relay.url } });
     const expired: string[] = [];
     a.ch.on("auth-expired", (r: string) => expired.push(r));
     await waitFor(() => a.closes.length > 0);
@@ -301,7 +301,7 @@ describe("team channel", () => {
     const alice = await user("alice");
     const { teamId } = await team(alice, [], [alice]);
     const fetches = countFetches(teamId);
-    const a = channel(alice, teamId, { session: { login: alice.login, token: alice.token, expiresAt: Date.now() / 1000 - 1 } });
+    const a = channel(alice, teamId, { session: { login: alice.login, token: alice.token, expiresAt: Date.now() / 1000 - 1, relay: relay.url } });
     await waitFor(() => a.closes.length > 0);
     expect(a.ch.status).toBe(SIGN_IN_EXPIRED);
     await sleep(300);
@@ -310,7 +310,7 @@ describe("team channel", () => {
 
   it("backs off exponentially with jitter while the relay is unreachable, and stop() cancels the retry", async () => {
     const alice = await user("alice");
-    const ch = new TeamChannel({ relayHttp: "http://127.0.0.1:1", teamId: "0123456789abcdef", session: session(alice), id: alice.id, retry: { baseMs: 40, maxMs: 320 } });
+    const ch = new TeamChannel({ relayHttp: "http://127.0.0.1:1", teamId: "0123456789abcdef", session: { ...session(alice), relay: "http://127.0.0.1:1" }, id: alice.id, retry: { baseMs: 40, maxMs: 320 } });
     ch.on("relay-error", () => {});
     const delays: number[] = [];
     ch.on("retry", (ms: number) => delays.push(ms));
