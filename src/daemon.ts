@@ -27,8 +27,8 @@ export interface PeerInfo {
 export type { ServerInfo };
 
 export interface DaemonOptions {
-  /** Group secret from pairing. Used to build a GroupChannel when no `channel` is given. */
-  secret: string;
+  /** Group secret from pairing. Needed to build a GroupChannel when no `channel` is given. */
+  secret?: string;
   relay: string;
   /** Transport to run over. Defaults to a GroupChannel built from `secret` / `relay`. */
   channel?: Channel;
@@ -81,7 +81,8 @@ export class Daemon extends EventEmitter {
   constructor(private readonly opts: DaemonOptions) {
     super();
     this.share = opts.share === undefined ? { label: opts.project } : opts.share;
-    this.channel = opts.channel ?? new GroupChannel({ secret: opts.secret, relay: opts.relay, version: opts.version });
+    if (!opts.channel && !opts.secret) throw new Error("no group secret and no channel");
+    this.channel = opts.channel ?? new GroupChannel({ secret: opts.secret!, relay: opts.relay, version: opts.version });
     this.wireChannel();
   }
 
@@ -172,7 +173,12 @@ export class Daemon extends EventEmitter {
     return this.channel.connected;
   }
 
-  get sharing(): { label: string } | null {
+  /** The name this daemon announces itself as (the login, on a team). */
+  get name(): string {
+    return this.opts.name;
+  }
+
+    get sharing(): { label: string } | null {
     return this.share;
   }
 

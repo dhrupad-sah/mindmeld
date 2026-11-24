@@ -7,6 +7,7 @@ import { answerWithFork } from "./answerer.js";
 import { DEFAULT_RELAY, defaultName, deleteConfig, homeDir, loadConfig, saveConfig, type Config } from "./config.js";
 import { generateGroupSecret, generateInviteCode } from "./crypto.js";
 import { Daemon, type AskState, type Decide, type Decision } from "./daemon.js";
+import { setupTeams } from "./mcpteam.js";
 import { runInviter, runJoiner } from "./pairing.js";
 import { fenceUntrusted } from "./protocol.js";
 import { listSessions } from "./sessions.js";
@@ -145,10 +146,17 @@ export async function runMcpServer(): Promise<void> {
     return r.action === "accept" ? { action: "send", text: draft } : { action: "decline", reason: "declined to send the answer" };
   }
 
+  const teams = setupTeams({ server, elicit, loadConfig: loadConfigOrNull, reconnect });
+
   function connect(config: Config) {
     void daemon?.stop();
+    daemon = null;
+    const how = teams.channelFor(config);
+    if (!how) return; // in a team but not signed in: status and the tools say so
     daemon = new Daemon({
       ...config,
+      name: how.name,
+      channel: how.channel,
       project: basename(cwd),
       share,
       decide,
@@ -196,18 +204,29 @@ export async function runMcpServer(): Promise<void> {
   const existing = loadConfigOrNull();
   if (existing) connect(existing);
 
-  // Every open session holds its own connection. If the group changes elsewhere (left, or
-  // re-paired from another session or the CLI), follow it here within a few seconds.
-  let knownSecret = existing?.secret ?? null;
+  // Every open session holds its own connection. If the group or team changes elsewhere (left,
+  // re-paired, a team created or joined, signed in), follow it here within a few seconds.
+  let knownKey = teams.watchKey(existing);
   const watch = setInterval(() => {
     const c = loadConfigOrNull();
-    const secret = c?.secret ?? null;
-    if (secret === knownSecret) return;
-    knownSecret = secret;
+    const key = teams.watchKey(c);
+    if (key === knownKey) return;
+    knownKey = key;
     if (c) connect(c);
     else disconnect();
   }, 3000);
   watch.unref();
+
+  /** Reconnect from the saved config now (after a sign-in or a team change in this session). */
+  function reconnect() {
+    const c = loadConfigOrNull();
+    knownKey = teams.watchKey(c);
+    if (c) connect(c);
+    else disconnect();
+  }
+
+  /** Why the peer tools can't work right now: team sign-in or connection trouble, or not paired. */
+  const notReady = () => teams.blocker() ?? (daemon ? null : NOT_PAIRED);
 
   server.registerTool(
     "list_peers",
@@ -217,7 +236,8 @@ export async function runMcpServer(): Promise<void> {
       inputSchema: {},
     },
     async () => {
-      if (!daemon) return text(NOT_PAIRED);
+      const why = notReady();
+      if (why || !daemon) return text(why ?? NOT_PAIRED);
       const peers = daemon.onlinePeers();
       if (peers.length === 0) return withNotices(text("Nobody is sharing a session right now. Teammates appear here after they run /mindmeld:share."));
       return withNotices(text(peers.map((p) => `- ${p.name}: "${p.project}"${p.activeAt ? ` · active ${ago(p.activeAt)}` : ""}`).join("\n")));
@@ -240,7 +260,8 @@ export async function runMcpServer(): Promise<void> {
       },
     },
     async ({ question, peer, context, timeout_sec }, extra) => {
-      if (!daemon) return text(NOT_PAIRED, true);
+      const why = notReady();
+      if (why || !daemon) return text(why ?? NOT_PAIRED, true);
       const token = extra._meta?.progressToken;
       let step = 0;
       const progress = (message: string) => {
@@ -269,7 +290,8 @@ export async function runMcpServer(): Promise<void> {
       },
     },
     async ({ title, text: body, peer }) => {
-      if (!daemon) return text(NOT_PAIRED, true);
+      const why = notReady();
+      if (why || !daemon) return text(why ?? NOT_PAIRED, true);
       const r = daemon.snippet(title, body, peer);
       return "error" in r ? text(r.error, true) : text(`Shared with ${r.to}.`);
     },
@@ -283,7 +305,7 @@ export async function runMcpServer(): Promise<void> {
       inputSchema: {},
     },
     async () => {
-      if (!daemon) return text(NOT_PAIRED);
+      if (!daemon) return text(notReady() ?? NOT_PAIRED);
       const items = daemon.drainInbox();
       if (items.length === 0) return text("Inbox is empty.");
       return text(items.map((i) => fenceUntrusted(i.from, `# ${i.title}\n${i.text}`)).join("\n\n"));
@@ -302,13 +324,13 @@ export async function runMcpServer(): Promise<void> {
       },
     },
     async ({ label }) => {
-      if (!daemon) return text(NOT_PAIRED, true);
+      if (!daemon) return text(notReady() ?? NOT_PAIRED, true);
       share = { label: (label ?? basename(cwd)).trim() || basename(cwd) };
       daemon.setShare(share);
       return text(
         [
           `This session is now shared with your mindmeld group as "${share.label}".`,
-          `They can see: your name ("${loadConfigOrNull()?.name}"), the label "${share.label}", and when the session was last active. Nothing else: not your prompts, files or transcript.`,
+          `They can see: your name ("${daemon.name}"), the label "${share.label}", and when the session was last active. Nothing else: not your prompts, files or transcript.`,
           "Each question shows an Accept/Decline dialog here, and answers come from a read-only copy of this session that can only read files inside this project (never .env or key files).",
           "Run /mindmeld:stop to stop sharing. Closing this session stops it too.",
         ].join("\n"),
@@ -340,13 +362,15 @@ export async function runMcpServer(): Promise<void> {
     },
     async () => {
       const c = loadConfigOrNull();
-      if (!c || !daemon) return text(NOT_PAIRED);
+      const teamLines = await teams.statusLines(c);
+      if (!c || !daemon) return text([...(c?.team ? [] : [NOT_PAIRED]), ...teamLines].join("\n"));
       const peers = daemon.onlinePeers();
       const lines = [
-        `Connection: ${daemon.server?.blocked ? "blocked: this version is too old" : daemon.connected ? "connected" : "NOT connected (reconnecting to the relay)"}`,
+        `Connection: ${daemon.server?.blocked ? "blocked: this version is too old" : daemon.connected ? "connected" : `NOT connected (${c.team ? "see below" : "reconnecting to the relay"})`}`,
         `Version: ${VERSION}`,
         ...notices(),
-        `You appear as: ${c.name}`,
+        ...teamLines,
+        `You appear as: ${c.team ? `@${daemon.name}` : c.name}`,
         `This session: ${share ? `shared as "${share.label}"` : "private (not visible to anyone). Run /mindmeld:share to share it."}`,
         `Sharing now: ${peers.length ? peers.map((p) => `${p.name} ("${p.project}")`).join(", ") : "nobody"}`,
         `Always allowed (answered without dialogs): ${c.trusted?.length ? c.trusted.join(", ") : "nobody"}`,
@@ -391,7 +415,7 @@ export async function runMcpServer(): Promise<void> {
       }
       disconnect();
       deleteConfig();
-      knownSecret = null;
+      knownKey = teams.watchKey(null);
       return text("Left the group. Every session on this machine is now disconnected and the pairing is deleted. Use /mindmeld:invite or /mindmeld:join to connect again.");
     },
   );
@@ -434,17 +458,20 @@ export async function runMcpServer(): Promise<void> {
     },
     async ({ my_name }) => {
       const prev = loadConfigOrNull();
+      const secret = prev?.secret ?? generateGroupSecret();
       const config: Config = {
-        secret: prev?.secret ?? generateGroupSecret(),
+        ...prev,
+        secret,
         relay: prev?.relay ?? DEFAULT_RELAY,
         name: my_name ?? prev?.name ?? defaultName(),
         trusted: prev?.trusted,
       };
       saveConfig(config);
-      if (!daemon || !prev || my_name) connect(config);
+      knownKey = teams.watchKey(config);
+      if (!daemon || !prev?.secret || my_name) connect(config);
 
       const code = generateInviteCode();
-      runInviter({ relay: config.relay, code, secret: config.secret, name: config.name }).then(
+      runInviter({ relay: config.relay, code, secret, name: config.name }).then(
         ({ peerName }) => console.error(`mindmeld: ${peerName} joined`),
         (e) => console.error(`mindmeld: invite ${code} ended: ${(e as Error).message}`),
       );
@@ -480,8 +507,9 @@ export async function runMcpServer(): Promise<void> {
       const name = my_name ?? prev?.name ?? defaultName();
       try {
         const { secret, inviterName } = await runJoiner({ relay, code, name });
-        const config: Config = { secret, relay, name, trusted: prev?.secret === secret ? prev.trusted : [] };
+        const config: Config = { ...prev, secret, relay, name, trusted: prev?.secret === secret ? prev.trusted : [] };
         saveConfig(config);
+        knownKey = teams.watchKey(config);
         connect(config);
         return text(
           `Connected to ${inviterName}'s group as "${name}". ` +

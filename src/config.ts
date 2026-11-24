@@ -4,12 +4,14 @@ import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 
 export interface Config {
-  /** 256-bit group secret (hex), handed out during pairing. */
-  secret: string;
+  /** 256-bit group secret (hex), handed out during pairing. Absent on a team-only machine. */
+  secret?: string;
   relay: string;
   name: string;
   /** Peers whose questions are answered without asking (lowercased names). */
   trusted?: string[];
+  /** The team this machine is in (GitHub sign-in). When set it is used instead of the legacy group. */
+  team?: { teamId: string; name: string };
 }
 
 export function homeDir(): string {
@@ -44,7 +46,7 @@ function writeJson(file: string, value: unknown): void {
 export function loadConfig(): Config | null {
   const c = readJson<Partial<Config> & { code?: string }>("config.json");
   if (!c) return null;
-  if (!c.secret) {
+  if (!c.secret && !c.team) {
     throw new Error("this config is from claude-share 0.1 (code-based pairing). Pair again: `mindmeld pair --new-group` or `mindmeld join <code>`");
   }
   return c as Config;

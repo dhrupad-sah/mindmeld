@@ -84,3 +84,13 @@ export function loadSession(): Session | null {
   if (!isSession(s) || s.expiresAt <= Date.now() / 1000) return null;
   return { login: s.login, token: s.token, expiresAt: s.expiresAt };
 }
+
+/** Login of the saved session even if it has expired (null if there is none), to tell "expired" from "never signed in". */
+export function savedSessionLogin(): string | null {
+  try {
+    const s: unknown = JSON.parse(readFileSync(sessionPath(), "utf8"));
+    return isSession(s) ? s.login : null;
+  } catch {
+    return null;
+  }
+}
