@@ -44,7 +44,7 @@ describe("team tools over MCP", () => {
     }
   }
   function server(dir: string, opts: Parameters<typeof startServer>[2] = {}) {
-    const s = startServer(dir, { MINDMELD_RELAY: relay.url, MINDMELD_GITHUB_BASE: relay.github.url, MINDMELD_DEV: "1" }, opts);
+    const s = startServer(dir, { MINDMELD_RELAY: relay.url, MINDMELD_GITHUB_BASE: relay.github.url }, opts);
     stops.push(s.stop);
     return s;
   }
@@ -191,11 +191,26 @@ describe("team tools over MCP", () => {
 });
 
 describe("githubBase", () => {
-  it("ignores MINDMELD_GITHUB_BASE outside tests and development", () => {
-    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://evil.example" })).toBe("https://github.com");
-    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://evil.example", NODE_ENV: "production" })).toBe("https://github.com");
-    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://mock", NODE_ENV: "test" })).toBe("http://mock");
-    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://mock", MINDMELD_DEV: "1" })).toBe("http://mock");
+  it("accepts MINDMELD_GITHUB_BASE only for a loopback http mock", () => {
+    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://127.0.0.1:8123" })).toBe("http://127.0.0.1:8123");
+    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://localhost:9000/" })).toBe("http://localhost:9000");
+    for (const v of [
+      "http://evil.example",
+      "https://evil.example",
+      "http://127.0.0.1", // no port
+      "http://127.0.0.1.evil.example:80",
+      "http://localhost.evil.example:80",
+      "http://user@evil.example:80@127.0.0.1:80",
+      "https://127.0.0.1:8123",
+      "http://127.0.0.1:8123/path",
+      "file:///etc/passwd",
+      "not a url",
+    ]) {
+      expect(githubBase({ MINDMELD_GITHUB_BASE: v }), v).toBe("https://github.com");
+    }
+    // The old development switches no longer unlock anything.
+    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://mock", NODE_ENV: "test" })).toBe("https://github.com");
+    expect(githubBase({ MINDMELD_GITHUB_BASE: "http://evil.example", MINDMELD_DEV: "1" })).toBe("https://github.com");
     expect(githubBase({})).toBe("https://github.com");
   });
 });

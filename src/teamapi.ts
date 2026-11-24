@@ -82,13 +82,13 @@ export const setRole = (relay: string, s: Session, teamId: string, login: string
   teamCall(relay, s, "POST", `/v1/teams/${teamId}/roles`, { login: normLogin(login), role });
 
 /**
- * Where the device flow runs. Always https://github.com, except in tests or development
- * (NODE_ENV=test or MINDMELD_DEV=1), where MINDMELD_GITHUB_BASE may point it at a mock. Otherwise a
- * project-supplied env could send the sign-in, and the user's GitHub token, to another host.
+ * Where the device flow runs: https://github.com, unless MINDMELD_GITHUB_BASE is exactly
+ * http://127.0.0.1:<port> or http://localhost:<port> (a local mock for tests). Nothing else is
+ * accepted, so a project-supplied env can't send the sign-in, and the user's GitHub token, to another host.
  */
 export function githubBase(env: NodeJS.ProcessEnv = process.env): string {
-  const dev = env.NODE_ENV === "test" || env.MINDMELD_DEV === "1";
-  return dev && env.MINDMELD_GITHUB_BASE ? env.MINDMELD_GITHUB_BASE : "https://github.com";
+  const m = /^http:\/\/(127\.0\.0\.1|localhost):(\d{1,5})\/?$/.exec(env.MINDMELD_GITHUB_BASE ?? "");
+  return m && Number(m[2]) > 0 && Number(m[2]) < 65536 ? `http://${m[1]}:${m[2]}` : "https://github.com";
 }
 
 /**
