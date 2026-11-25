@@ -10,8 +10,10 @@
   // Clients below MIN_VERSION are refused with an update message; below LATEST they see "update available".
   // Pre-0.5 clients don't report a version and are kept in their own pool.
   "vars": {
-    "LATEST_VERSION": "0.6.1",
+    "LATEST_VERSION": "0.7.0",
     "MIN_VERSION": "0.5.0",
+    // Team sockets (/v1/teams/:id/ws) refuse clients below this: team messages are sealed per recipient from 0.7.
+    "TEAM_MIN_VERSION": "0.7.0",
     // Where the relay checks GitHub sign-ins (tests point this at a mock).
     "GITHUB_API_BASE": "https://api.github.com"
   },

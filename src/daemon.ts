@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { type Channel, GroupChannel, type PayloadSender, type ServerInfo } from "./channel.js";
+import { type Channel, GroupChannel, type PayloadSender, type SendTarget, type ServerInfo } from "./channel.js";
 import { ACTIVITY_CHECK_MS, ACTIVITY_RESOLUTION_MS, Payload, PROTOCOL_VERSION } from "./protocol.js";
 
 type Ask = Extract<Payload, { type: "ask" }>;
@@ -61,6 +61,11 @@ interface PendingAsk {
   declines: string[];
 }
 
+/** A directed payload the channel could not address (e.g. the peer's device is no longer on the team roster). */
+const unreachable = (name: string) => `can't reach ${name}'s session right now`;
+/** Peer-id ownership bindings kept, so hello spam with random peer ids stays bounded. */
+const MAX_PEER_OWNERS = 1000;
+
 export class Daemon extends EventEmitter {
   readonly peerId = randomUUID();
   private readonly channel: Channel;
@@ -73,7 +78,8 @@ export class Daemon extends EventEmitter {
   private readonly askLog = new Map<string, number[]>();
   /**
    * Verified login that first used each peer id (only for channels that report logins). A hello,
-   * bye or reply for that peer id from any other login is ignored. Never cleared: peer ids are random.
+   * bye or reply for that peer id from any other login is ignored. Bounded by MAX_PEER_OWNERS: beyond
+   * it, the oldest bindings of peers that are not online are forgotten.
    */
   private readonly peerOwner = new Map<string, string>();
   private share: { label: string } | null;
@@ -165,8 +171,12 @@ export class Daemon extends EventEmitter {
     ch.on("payload", (p: Payload, from: PayloadSender) => this.handlePayload(p, from));
   }
 
-  private send(p: Payload): void {
-    this.channel.send(p);
+  /**
+   * Hand a payload to the channel. Directed payloads carry their recipient (`to`); presence (hello,
+   * bye) never does. False when the channel cannot resolve the recipient (nothing was sent).
+   */
+  private send(p: Payload, to?: SendTarget): boolean {
+    return this.channel.send(p, to);
   }
 
   get connected(): boolean {
@@ -231,7 +241,15 @@ export class Daemon extends EventEmitter {
   private ownsPeer(peerId: string, login: string | undefined): boolean {
     if (login === undefined) return true;
     const owner = this.peerOwner.get(peerId);
-    if (owner === undefined) this.peerOwner.set(peerId, login);
+    if (owner === undefined) {
+      this.peerOwner.set(peerId, login);
+      if (this.peerOwner.size > MAX_PEER_OWNERS) {
+        for (const old of this.peerOwner.keys()) {
+          if (this.peerOwner.size <= MAX_PEER_OWNERS) break;
+          if (!this.peers.has(old) && old !== peerId) this.peerOwner.delete(old);
+        }
+      }
+    }
     return owner === undefined || owner === login;
   }
 
@@ -269,7 +287,7 @@ export class Daemon extends EventEmitter {
         break;
       case "ask":
         // Only a shared session answers, and only questions addressed to it (or legacy broadcasts).
-        if (this.share && (!p.to || p.to === this.opts.name || p.to === this.peerId)) void this.handleAsk(p, login, owner);
+        if (this.share && (!p.to || p.to === this.opts.name || p.to === this.peerId)) void this.handleAsk(p, login, owner, from.device);
         break;
       case "status": {
         const pending = this.pending.get(p.id);
@@ -321,15 +339,17 @@ export class Daemon extends EventEmitter {
 
   private readonly seenAsks = new Set<string>();
 
-  private async handleAsk(ask: Ask, login?: string, owner?: string): Promise<void> {
+  private async handleAsk(ask: Ask, login?: string, owner?: string, device?: string): Promise<void> {
     if (this.seenAsks.has(ask.id)) return; // a resend of a question already being handled
     this.seenAsks.add(ask.id);
+    // Replies go back to the device the question came from (askers never send a hello).
+    const asker: SendTarget = { device };
     const reply = (d: Decision) =>
       d.action === "send"
-        ? this.send({ type: "answer", id: ask.id, from: this.peerId, text: d.text })
-        : this.send({ type: "decline", id: ask.id, from: this.peerId, reason: d.reason });
+        ? this.send({ type: "answer", id: ask.id, from: this.peerId, text: d.text }, asker)
+        : this.send({ type: "decline", id: ask.id, from: this.peerId, reason: d.reason }, asker);
 
-    const report = (state: AskState) => this.send({ type: "status", id: ask.id, from: this.peerId, state });
+    const report = (state: AskState) => void this.send({ type: "status", id: ask.id, from: this.peerId, state }, asker);
     report("received");
     // A verified identity cannot dodge the limit by rotating peer ids.
     if (this.rateLimited(owner ?? login ?? ask.from)) {
@@ -393,12 +413,13 @@ export class Daemon extends EventEmitter {
       };
       timers.push(setTimeout(() => finish({ error: `no answer within ${timeoutSec}s` }), timeoutSec * 1000));
       // Peers from 0.4 on acknowledge at once; older ones don't, so only hold newer ones to it.
+      const to: SendTarget = { peer: target.peer };
       const payload: Payload = { type: "ask", id, from: this.peerId, fromName: this.opts.name, to: target.peer, question, context: opts.context };
       if ((target.v ?? 0) >= 2) {
         // Not acknowledged halfway through the window: resend once (a frame can be lost while
         // the socket reconnects). The answering side ignores duplicate ids.
         const ackMs = this.opts.ackTimeoutMs ?? 15_000;
-        timers.push(setTimeout(() => !this.pending.get(id)?.acked && this.send(payload), ackMs / 2));
+        timers.push(setTimeout(() => !this.pending.get(id)?.acked && this.send(payload, to), ackMs / 2));
         timers.push(
           setTimeout(() => {
             if (!this.pending.get(id)?.acked) {
@@ -408,14 +429,16 @@ export class Daemon extends EventEmitter {
         );
       }
       this.pending.set(id, { target: target.peer, resolve: finish, onStatus: opts.onStatus, acked: false, expected: 1, declines: [] });
-      this.send(payload);
+      if (!this.send(payload, to)) finish({ error: unreachable(target.name) });
     });
   }
 
   snippet(title: string, text: string, peer?: string): { ok: true; to: string } | { error: string } {
     const target = this.route(peer);
     if ("error" in target) return target;
-    this.send({ type: "snippet", id: randomUUID(), from: this.peerId, to: target.peer, title, text });
+    if (!this.send({ type: "snippet", id: randomUUID(), from: this.peerId, to: target.peer, title, text }, { peer: target.peer })) {
+      return { error: unreachable(target.name) };
+    }
     return { ok: true, to: target.name };
   }
 

@@ -28,7 +28,7 @@ claude mcp add -s user mindmeld -- mindmeld mcp
 
 ## Teams (GitHub sign-in)
 
-A team is a group of people who sign in with GitHub. Each machine gets its own key pair, the team has a roster with admins and members, and an admin can remove someone for real: their devices are cut off and the team key is replaced, so they can't read anything sent afterwards. (Legacy groups below can't do that.) Teams need the hosted relay or your own relay running the 0.6 Worker. To use your own for teams, sign in with `mindmeld login --relay wss://your-relay` (or set `"teamRelay"` in `~/.mindmeld/config.json`); environment variables never change where your GitHub sign-in goes.
+A team is a group of people who sign in with GitHub. Each machine gets its own key pair, the team has a roster with admins and members, and an admin can remove someone for real: their devices are cut off and the team key is replaced, so they can't read anything sent afterwards. (Legacy groups below can't do that.) Teams need mindmeld 0.7 or later on every machine, and the hosted relay or your own relay running the 0.7 Worker. To use your own for teams, sign in with `mindmeld login --relay wss://your-relay` (or set `"teamRelay"` in `~/.mindmeld/config.json`); environment variables never change where your GitHub sign-in goes.
 
 1. **Sign in, everyone, once:** `/mindmeld:login`. Claude shows a code and a link. Open the link, enter the code, approve on GitHub. Sign-in finishes on its own and `/mindmeld:status` shows who you are. It lasts 7 days, then you sign in again.
 2. **Create a team (an admin):** `/mindmeld:team create core`. You're its first admin and this machine is connected to it.
@@ -41,7 +41,7 @@ A team is a group of people who sign in with GitHub. Each machine gets its own k
 
 **Removing someone:** `/mindmeld:team remove sarim-dev` (admins only). A dialog asks you to confirm. Then their devices are disconnected right away and the team key is rotated for everyone left. They keep whatever they already received, but not anything sent after.
 
-The relay learns team names, members' GitHub logins, roles, device public keys and who is connected. It never sees team keys or message content. One thing to know: the relay hands out the public keys, so a malicious relay could swap one. If that matters to you, compare fingerprints from `/mindmeld:team` with your teammates over another channel. Details, constructions and known gaps are in [`docs/security.md`](docs/security.md); it has not had an outside review yet.
+The relay learns team names, members' GitHub logins, roles, device public keys and who is connected. It never sees team keys or message content. Questions and answers are sealed to the one device they are for, so other team members don't receive them either; which sessions are shared (and their labels) is visible to the whole team. One thing to know: the relay hands out the public keys, so a malicious relay could swap one. If that matters to you, compare fingerprints from `/mindmeld:team` with your teammates over another channel. Details, constructions and known gaps are in [`docs/security.md`](docs/security.md); it has not had an outside review yet.
 
 ## Legacy groups (invite codes)
 

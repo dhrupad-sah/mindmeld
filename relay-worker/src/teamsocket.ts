@@ -1,13 +1,19 @@
 /**
- * Team WebSockets (GET /v1/teams/:id/ws), hosted by the Team Durable Object with the hibernation API.
- * The Worker authenticates the bearer token; the Team object admits only a member's own device that
- * holds a wrap at the current epoch. Otherwise the socket is accepted, then closed with:
- *   4001 "not a member of this team" / "removed from team", 4003 "no team key yet", 4004 "no such team".
+ * Team WebSockets (GET /v1/teams/:id/ws?v=<client version>), hosted by the Team Durable Object with the
+ * hibernation API. The Worker authenticates the bearer token; the Team object admits only a member's own
+ * device that holds a wrap at the current epoch, from a client at TEAM_MIN_VERSION or later. Otherwise
+ * the socket is accepted, then closed with:
+ *   4001 "not a member of this team" / "removed from team", 4003 "no team key yet", 4004 "no such team",
+ *   4005 "mindmeld <v> is too old for teams; update: ..." (no or old `v`).
  * An admitted socket first gets { t:"server", latest, minimum, epoch }; the others get
- * { t:"joined", c, uid, login }. A client frame { t:"msg", f: { e, dev, d, sig } } is forwarded to every
- * other socket as { t:"msg", f, c, uid, login } (only if f.dev is the socket's own device). `c`, `uid`
- * and `login` are for routing and presence (uid = GitHub numeric id); clients take identity from the
- * frame signature. On a roster change every socket gets { t:"roster" }; a close sends { t:"left", c, uid, login }.
+ * { t:"joined", c, uid, login }. Two kinds of client frame, both dropped unless `f.dev` is the socket's own device:
+ * - { t:"msg", f: { e, dev, d, sig } } (presence, under the team key) is forwarded to every other socket
+ *   as { t:"msg", f, c, uid, login }.
+ * - { t:"dm", to, f: { dev, to, s, sig } } (sealed to one device) is forwarded as { t:"dm", f, c, uid, login }
+ *   only to the sockets of device `to`, and only if `to` equals `f.to` and is a current team device.
+ *   It is never broadcast: other members' sockets get nothing.
+ * `c`, `uid` and `login` are for routing and presence (uid = GitHub numeric id); clients take identity
+ * from the frame signature. On a roster change every socket gets { t:"roster" }; a close sends { t:"left", c, uid, login }.
  */
 
 /** Stored on each team socket so it survives hibernation. */
@@ -26,6 +32,11 @@ export type Admission = { ok: true; epoch: number } | { ok: false; code: number;
 export const CLOSE_REMOVED = 4001;
 export const CLOSE_NO_KEY = 4003;
 export const CLOSE_NO_TEAM = 4004;
+export const CLOSE_TOO_OLD = 4005;
+
+/** Close reason for a team socket from a client below TEAM_MIN_VERSION (`v` is null when it sent none). */
+export const tooOldReason = (v: string | null) =>
+  `mindmeld ${v ?? "before 0.7"} is too old for teams; update: claude plugin update mindmeld@mindmeld`;
 
 const MAX_FRAME_BYTES = 1024 * 1024;
 const HEX16 = /^[0-9a-f]{16}$/;
@@ -35,19 +46,29 @@ const devTag = (deviceId: string) => `dev:${deviceId}`;
 const CALLER_UID = "x-mm-uid";
 const CALLER_LOGIN = "x-mm-login";
 const CALLER_DEVICE = "x-mm-device";
+const CALLER_VERSION = "x-mm-version";
+/** A client version as sent in `?v=`; anything else counts as no version. */
+const VERSION_RE = /^[0-9][0-9A-Za-z.+-]{0,31}$/;
 
 /**
  * The upgrade request the Worker sends the Team object after verifying the bearer token. It is built
  * fresh, so nothing client-supplied (headers included) reaches the Team object.
  */
-export function upgradeRequest(uid: number, login: string, deviceId: string): Request {
-  return new Request("https://team/ws", { headers: { upgrade: "websocket", [CALLER_UID]: String(uid), [CALLER_LOGIN]: login, [CALLER_DEVICE]: deviceId } });
+export function upgradeRequest(uid: number, login: string, deviceId: string, version: string | null): Request {
+  const headers: Record<string, string> = { upgrade: "websocket", [CALLER_UID]: String(uid), [CALLER_LOGIN]: login, [CALLER_DEVICE]: deviceId };
+  if (version !== null && VERSION_RE.test(version)) headers[CALLER_VERSION] = version;
+  return new Request("https://team/ws", { headers });
 }
 
-/** The verified caller of an `upgradeRequest` (uid 0 if missing, which matches no member). */
-export function socketCaller(req: Request): { uid: number; login: string; deviceId: string } {
+/** The verified caller of an `upgradeRequest` (uid 0 if missing, which matches no member), and its client version. */
+export function socketCaller(req: Request): { uid: number; login: string; deviceId: string; version: string | null } {
   const uid = Number(req.headers.get(CALLER_UID) ?? "");
-  return { uid: Number.isSafeInteger(uid) && uid > 0 ? uid : 0, login: req.headers.get(CALLER_LOGIN) ?? "", deviceId: req.headers.get(CALLER_DEVICE) ?? "" };
+  return {
+    uid: Number.isSafeInteger(uid) && uid > 0 ? uid : 0,
+    login: req.headers.get(CALLER_LOGIN) ?? "",
+    deviceId: req.headers.get(CALLER_DEVICE) ?? "",
+    version: req.headers.get(CALLER_VERSION),
+  };
 }
 
 function trySend(ws: WebSocket, msg: string): void {
@@ -63,6 +84,8 @@ export class TeamSockets {
   constructor(
     private readonly ctx: DurableObjectState,
     private readonly versions: () => { latest: string; minimum: string },
+    /** Whether a device is on the team roster now (a dm is only delivered to one). */
+    private readonly isTeamDevice: (deviceId: string) => boolean,
   ) {}
 
   private open(): { ws: WebSocket; me: TeamSocketAttachment }[] {
@@ -95,24 +118,39 @@ export class TeamSockets {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  /** Forward a member's frame to the other sockets, stamped with its connection id, uid and login. */
+  /**
+   * Forward a member's frame, stamped with its connection id, uid and login: a "msg" to every other
+   * socket, a "dm" only to the recipient device's sockets. Anything malformed is dropped.
+   */
   message(ws: WebSocket, message: string | ArrayBuffer): void {
     if (typeof message !== "string" || message.length > MAX_FRAME_BYTES) return;
     const me = ws.deserializeAttachment() as TeamSocketAttachment | null;
     if (!me || me.closed) return;
-    let frame: { t?: unknown; f?: Record<string, unknown> };
+    let frame: { t?: unknown; to?: unknown; f?: Record<string, unknown> };
     try {
       frame = JSON.parse(message);
     } catch {
       return;
     }
     const f = frame?.f;
-    if (frame?.t !== "msg" || !f || typeof f !== "object") return;
-    if (!Number.isSafeInteger(f.e) || typeof f.dev !== "string" || !HEX16.test(f.dev) || typeof f.d !== "string" || typeof f.sig !== "string") return;
+    if (!f || typeof f !== "object" || typeof f.dev !== "string" || !HEX16.test(f.dev) || typeof f.sig !== "string") return;
     // A device only speaks for itself (clients check the signature regardless).
     if (f.dev !== me.deviceId) return;
-    const out = JSON.stringify({ t: "msg", f: { e: f.e, dev: f.dev, d: f.d, sig: f.sig }, c: me.cid, uid: me.uid, login: me.login });
-    this.broadcast(out, ws);
+    const stamp = { c: me.cid, uid: me.uid, login: me.login };
+    if (frame.t === "msg") {
+      if (!Number.isSafeInteger(f.e) || typeof f.d !== "string") return;
+      this.broadcast(JSON.stringify({ t: "msg", f: { e: f.e, dev: f.dev, d: f.d, sig: f.sig }, ...stamp }), ws);
+    } else if (frame.t === "dm") {
+      const to = frame.to;
+      if (typeof to !== "string" || !HEX16.test(to) || f.to !== to || typeof f.s !== "string") return;
+      if (!this.isTeamDevice(to)) return;
+      const out = JSON.stringify({ t: "dm", f: { dev: f.dev, to, s: f.s, sig: f.sig }, ...stamp });
+      for (const other of this.ctx.getWebSockets(devTag(to))) {
+        if (other === ws) continue;
+        const a = other.deserializeAttachment() as TeamSocketAttachment | null;
+        if (a && !a.closed) trySend(other, out);
+      }
+    }
   }
 
   /** A socket closed (by its client, or after an error): tell the others. */

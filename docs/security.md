@@ -1,6 +1,6 @@
 # mindmeld security
 
-This page is for people reviewing mindmeld's security design. It describes what is built as of 0.6.0, with the exact constructions, and it lists what is not covered. **None of this has had an external cryptography review yet.** The code is small and the sources are named below so you can check each claim.
+This page is for people reviewing mindmeld's security design. It describes what is built as of 0.7.0, with the exact constructions, and it lists what is not covered. **None of this has had an external cryptography review yet.** The code is small and the sources are named below so you can check each claim.
 
 mindmeld has two ways to connect people:
 
@@ -17,8 +17,11 @@ Teams:
 - Each device's public keys (Ed25519 signing key and X25519 box key) and device id.
 - Which devices are connected right now, when, and how much data moves.
 - Sealed (encrypted) team keys, one per device per epoch, and the signatures on them.
+- For each direct message (a question, a progress status, an answer, a decline or a snippet): the team, the sending device id, the recipient device id, when it was sent and its size. Not its content, and not which kind of payload it is (though size and timing may suggest it, e.g. small fixed-size statuses).
 
-The relay never sees team keys or the plaintext of anything the team sends. Frames pass through as ciphertext plus a signature. An honest relay (the hosted one runs the code in `relay-worker/`) also never stores your GitHub token: it uses the token once to ask GitHub who you are, then drops it. A relay you don't control can do whatever it likes with the token (see Known gaps).
+The relay never sees team keys or the plaintext of anything the team sends. Frames pass through as ciphertext plus a signature.
+
+**Who receives what.** Presence (a shared session's `hello` with its owner's login, label and last-active time, and `bye`) is broadcast to every member's devices under the team key, so every member sees who is sharing which session. Everything between two people is sealed to the recipient device and the relay delivers it only to that device: other members' devices receive nothing for it, not even ciphertext (see [Direct messages](#direct-messages)). An honest relay (the hosted one runs the code in `relay-worker/`) also never stores your GitHub token: it uses the token once to ask GitHub who you are, then drops it. A relay you don't control can do whatever it likes with the token (see Known gaps).
 
 **Identity is the GitHub numeric user id.** GitHub logins can be renamed, and a freed login can be registered by someone else, so the relay keys accounts, team members, devices and keys by the numeric `id` from `GET /user`. The login is kept for display and refreshed whenever the member signs in or uses the team. Invites are addressed by login (that is what admins type) and bind to the GitHub id of whoever accepts them while holding that login.
 
@@ -69,7 +72,7 @@ Seals bytes (a team key) to one device's X25519 key:
 
 - Fresh ephemeral X25519 key pair per call. `shared = X25519(ephPriv, boxPub)`.
 - `key = HKDF-SHA256(ikm = shared, salt = ephPub (32 bytes) || boxPub (32 bytes), info = "mindmeld/seal/v1", length = 32)`.
-- AES-256-GCM with a random 96-bit nonce, no AAD.
+- AES-256-GCM with a random 96-bit nonce. No AAD for key wraps; direct messages pass an AAD (below).
 - Output: `base64(ephPub || nonce || ciphertext || tag)`.
 
 The key is used once, so nonce reuse cannot happen. The sender is anonymous at this layer; authenticity comes from the signed wrap below.
@@ -98,18 +101,35 @@ The client does not trust the relay's checks. Before using a key for an epoch, i
 
 An epoch that fails any check is dropped and reported (for example "team key for epoch 3 failed verification (bad wrap signature)").
 
-### Frames
+### Broadcast frames (presence)
 
-Every message between team members is a frame `{ e, dev, d, sig }`:
+Presence payloads (`hello`, `bye`) go to the whole team as a frame `{ e, dev, d, sig }`:
 
 - `d = base64(nonce || ciphertext || tag)` of AES-256-GCM(team key for epoch `e`, payload, random 96-bit nonce, AAD = `"mindmeld/frame/v1|" + e + "|" + dev`).
 - `sig = Ed25519(signPriv, UTF-8(e + "|" + dev + "|" + d))`.
 
-The receiver checks that `dev` is 16 lowercase hex characters, looks it up in the roster, **verifies the signature first**, then decrypts. The sender (GitHub id, and login for display) comes from the roster entry for the verified device, not from anything the relay stamps on it; a frame whose relay-stamped GitHub id disagrees is dropped, and a connection stays bound to the GitHub id of its first verified frame. The relay forwards a frame only if `dev` is the sending socket's own device.
+The receiver checks that `dev` is 16 lowercase hex characters, looks it up in the roster, **verifies the signature first**, then decrypts. The sender (GitHub id, and login for display) comes from the roster entry for the verified device, not from anything the relay stamps on it; a frame whose relay-stamped GitHub id disagrees is dropped, and a connection stays bound to the GitHub id of its first verified frame. The relay forwards a frame only if `dev` is the sending socket's own device, and sends it to every other team socket. Only `hello` and `bye` are ever broadcast (an allowlist: any other payload kind, including one a later version adds, must go as a direct message or not at all), and a broadcast frame that turns out to carry anything else is dropped by the receiver.
+
+### Direct messages
+
+Questions, progress statuses, answers, declines and snippets go to one device. The client sends the relay `{ t: "dm", to, f: { dev, to, s, sig } }`:
+
+- `s = sealToDevice(recipient boxPub, UTF-8(payload JSON), AAD = UTF-8("mm-dm|v1|" + teamId + "|" + dev + "|" + to))`, the construction above (fresh ephemeral X25519 key, HKDF-SHA256 with info `"mindmeld/seal/v1"`, AES-256-GCM). Only the recipient device's X25519 private key opens it. The AAD binds the sender: if someone (for example the relay colluding with another member) re-signs `s` under a different `dev`, it no longer opens.
+- `sig = Ed25519(signPriv of the sending device, UTF-8("mm-dm|v1|" + teamId + "|" + dev + "|" + to + "|" + s))`.
+
+Source: `sealDirect` and `openDirect` in `src/teamcrypto.ts`, routing in `src/teamchannel.ts` and `relay-worker/src/teamsocket.ts`.
+
+**Routing on the relay.** The relay forwards a `dm` only if `f.dev` is the sending socket's own device, `to` equals `f.to`, and `to` is a device currently on the team roster. It then sends `{ t: "dm", f, c, uid, login }` (stamped like a broadcast frame) only to the sockets of device `to`, never to anyone else. Anything else is dropped. A device may have several sockets (several Claude sessions on one machine share its device key); all of them get it, and each session keeps only what is meant for it: a question or snippet addressed to its own peer id, or a status, answer or decline whose id matches a question it is waiting on.
+
+**Addressing on the client.** An ask or snippet names the target session's peer id; the client seals it to the device that sent that peer id's verified `hello`. A peer id stays bound to the GitHub id that announced it: a `hello` or `bye` for it from another member is dropped. The binding goes when that peer says `bye`, when its connection closes, or when it is evicted (at most 1,000 are kept, oldest first). Statuses, answers and declines go back to the device the question came from, which is known from the question's verified signature (askers never announce themselves). If the recipient can't be resolved to a device on the current roster, nothing is sent, and the ask fails with "can't reach <name>'s session right now". There is no fallback to a broadcast.
+
+**Checks on receipt.** The receiver requires, in order: `dev` and `to` are 16 lowercase hex characters; `to` is its own device id; `dev` is a device on the current roster; the signature verifies against that device's signing key (strict, `zip215: false`); `s` opens with its own X25519 key and the AAD built from `teamId`, `dev` and `to`. The sender (GitHub id, and login for display) is the roster entry for `dev`, never anything in the payload; a frame whose relay-stamped GitHub id disagrees is dropped, and the connection binding applies as for broadcast frames. A `dm` carrying `hello` or `bye` is dropped. Anything that fails a check is dropped (and counted in the channel's `framesDropped`).
+
+**Client versions.** Team sockets carry the client version (`?v=`). The relay refuses team clients below `TEAM_MIN_VERSION` (0.7.0), or that send no version, closing with code 4005 and "mindmeld <v> is too old for teams; update: claude plugin update mindmeld@mindmeld". So no team member can still be sending questions or answers under the team key. Legacy groups keep their own minimum (0.5.0).
 
 ### Which signature checks are strict
 
-Every Ed25519 check uses `zip215: false` (strict RFC 8032 style verification, which also refuses small-order keys): the sign-in device proof (relay), wrap and commitment signatures on the relay when they are written (`relay-worker/src/team.ts`), wrap and commitment signatures on the client (`src/teamkeys.ts`), and frame signatures in `openFrame` (`src/teamcrypto.ts`). `openFrame` also refuses a frame whose `dev` is not exactly 16 lowercase hex characters before it looks anything up.
+Every Ed25519 check uses `zip215: false` (strict RFC 8032 style verification, which also refuses small-order keys): the sign-in device proof (relay), wrap and commitment signatures on the relay when they are written (`relay-worker/src/team.ts`), wrap and commitment signatures on the client (`src/teamkeys.ts`), frame signatures in `openFrame` and direct message signatures in `openDirect` (`src/teamcrypto.ts`). Both also refuse a frame whose `dev` (and, for `openDirect`, `to`) is not exactly 16 lowercase hex characters before they look anything up.
 
 ## Removing a member
 
@@ -125,7 +145,7 @@ From then on the removed person cannot read anything sent at the new epoch. If t
 Limits you should understand:
 
 - Anything the removed member already received, including earlier epochs' keys they held, stays readable to them. Rotation protects the future, not the past.
-- Between step 1 and step 2 the old key is still the current one. The removed person has already lost their connection and their wraps, but a copy of the old key they kept would still decrypt anything of that epoch they can get hold of.
+- Between step 1 and step 2 the old key is still the current one. The removed person has already lost their connection and their wraps, but a copy of the old key they kept would still decrypt presence frames of that epoch they can get hold of. Direct messages are not under the team key: once their devices leave the roster, nobody seals to them and the relay delivers nothing to them.
 - The relay keeps wraps for the current epoch and **2 previous epochs** per device, so a device can read recent history and drop older ones.
 
 ## Legacy groups
@@ -151,9 +171,9 @@ Everyone in a legacy group holds the same secret. That is why there is no per-pe
 ## Known gaps
 
 - **No external cryptography review yet.** Custom constructions (sealToDevice, frame format, wraps, commitments, token format, SPAKE2 parameter choices) were designed and tested by the author only.
-- **The relay distributes public keys.** Rosters, device keys and invites come from the relay, and clients trust them as given. A malicious or compromised relay could hand out a substituted key or plant an extra device for a member, and then receive team keys sealed to it. Mitigation: compare device fingerprints out of band using `/mindmeld:team`. Nothing forces you to do this. Admin-only rotation is enforced by the relay alone: a malicious relay could accept a rotation from a non-admin member's device, and clients would accept it.
-- **No replay, reorder or drop protection for team frames.** Frames carry no counter, so a relay (or anyone who captured a frame) can withhold or re-send valid frames within an epoch, including to a reconnecting device.
-- **No forward secrecy within an epoch.** Anyone who gets a team key can read every frame sent in that epoch, including recorded ones. Keys change only when an admin rotates (on removal).
+- **The relay distributes public keys.** Rosters, device keys and invites come from the relay, and clients trust them as given. A malicious or compromised relay could hand out a substituted key or plant an extra device for a member, and then receive team keys sealed to it. With a substituted X25519 key for a member's device it could also read direct messages sealed to that device, and with a planted device it could send signed direct messages as that member. Mitigation: compare device fingerprints out of band using `/mindmeld:team`. Nothing forces you to do this. Admin-only rotation is enforced by the relay alone: a malicious relay could accept a rotation from a non-admin member's device, and clients would accept it.
+- **No replay, reorder or drop protection for team frames.** Broadcast frames and direct messages carry no counter or timestamp, so a relay (or anyone who captured a frame) can withhold or re-send valid frames, including to a reconnecting device. A direct message can only be replayed to the device it was sealed to; a re-sent question with an id already seen is ignored.
+- **No forward secrecy.** Anyone who gets a team key can read every presence frame sent in that epoch, including recorded ones; keys change only when an admin rotates (on removal). Direct messages are sealed to the recipient device's long-term X25519 key, so anyone who later gets that device's `identity.json` can read every recorded direct message sent to it.
 - **Stateless challenge replay window.** The sign-in challenge is not recorded as used, so within its 5 minute life the same nonce can be presented again. Using it still needs a valid device signature and a GitHub token for that account, so a replay by a third party does not help them.
 - **Names inside legacy groups are not authenticated.** Any member can claim another member's name, and "always allow" trusts a name. The "always allow" list is cleared when the machine switches to a team, so a legacy name can't match a GitHub login.
 - **The answering fork relies on Claude Code's permission rules.** If those rules have a bug, the fork's read limits do too.
@@ -162,7 +182,7 @@ Everyone in a legacy group holds the same secret. That is why there is no per-pe
 - **The relay accepts any GitHub token that GitHub's `/user` accepts.** That includes personal access tokens and tokens issued to other apps, not only tokens issued to mindmeld's GitHub App. Anyone holding such a token for your account can sign in to mindmeld as you and register a device. Binding sign-in to mindmeld's app needs the app's client secret on the relay (to check the token with GitHub's application API); that is planned.
 - **Session tokens can't be revoked before they expire.** A session token is valid for 7 days. Removing the member from a team stops it working for that team, but there is no per-token or per-device revocation otherwise.
 - **The relay can delay or hide a removal or rotation.** Clients take the roster and the current epoch from the relay and don't check that they see the latest one. A malicious relay could keep showing a removed member, or keep a client on an old epoch, and that client would keep sealing to the old key.
-- **Frame metadata is in the clear.** The relay (and anyone on the path to it) sees each frame's epoch, sending device id, size and timing, and who is connected.
+- **Frame metadata is in the clear.** The relay (and anyone on the path to it) sees each broadcast frame's epoch, sending device id, size and timing, each direct message's sending and recipient device ids, size and timing (so it learns who asks whom, and when), and who is connected.
 - **A new device may never get the key.** A device that joins gets the team key only when a device that already holds it comes online. If no key holder comes online (for example the team's only other member has left for good), the new device keeps waiting; status says so.
 - **Session labels** come from Claude Code's on-disk transcript layout, which is not a documented API.
 - **Windows file protection** for `identity.json` and `session.json` is the user profile ACLs, not mode 600.
