@@ -92,3 +92,56 @@ export function openFrame(
     return null;
   }
 }
+
+/** A message to one device on the wire: sending device id, recipient device id, sealed payload (base64), Ed25519 signature (hex). */
+export interface DirectFrame {
+  dev: string;
+  to: string;
+  s: string;
+  sig: string;
+}
+
+const directSigMessage = (teamId: string, dev: string, to: string, s: string) => new TextEncoder().encode(`mm-dm|v1|${teamId}|${dev}|${to}|${s}`);
+
+/**
+ * Seal and sign a payload for one recipient device (questions, answers, statuses, declines, snippets).
+ * s   = sealToDevice(to.boxPub, utf8 payload), the construction documented on `sealToDevice`
+ *       (fresh ephemeral X25519, HKDF-SHA256 "mindmeld/seal/v1", AES-256-GCM);
+ * sig = hex Ed25519(signPriv, utf8("mm-dm|v1|" + teamId + "|" + id.deviceId + "|" + to.deviceId + "|" + s)).
+ * Only the recipient's boxPriv opens `s`; the signature binds the sender device, the recipient device and the team.
+ */
+export function sealDirect(teamId: string, id: DeviceIdentity, to: { deviceId: string; boxPub: string }, payload: string): DirectFrame {
+  const s = sealToDevice(to.boxPub, new TextEncoder().encode(payload));
+  const sig = Buffer.from(ed25519.sign(directSigMessage(teamId, id.deviceId, to.deviceId, s), hexToBytes(id.signPriv))).toString("hex");
+  return { dev: id.deviceId, to: to.deviceId, s, sig };
+}
+
+/**
+ * Verify then open a direct frame addressed to this device. `f.dev` and `f.to` must be exactly 16
+ * lowercase hex (checked first) and `f.to` must be `id.deviceId`. The sender is looked up in `roster`
+ * by `f.dev`; the Ed25519 signature over utf8("mm-dm|v1|" + teamId + "|" + dev + "|" + to + "|" + s)
+ * is checked (strict Ed25519, zip215: false) against that entry's signPub BEFORE opening; then `s` is
+ * opened with `openFromDevice` and decoded as strict UTF-8. Returns the roster uid, login and payload,
+ * or null on any failure (wrong recipient, unknown device, bad signature, decrypt failure, malformed
+ * input); never throws.
+ */
+export function openDirect(
+  teamId: string,
+  f: DirectFrame,
+  id: DeviceIdentity,
+  roster: Map<string, { uid: number; login: string; signPub: string }>,
+): { uid: number; login: string; payload: string } | null {
+  try {
+    if (!f || typeof f !== "object" || typeof f.dev !== "string" || !DEVICE_ID.test(f.dev) || typeof f.to !== "string" || !DEVICE_ID.test(f.to)) return null;
+    if (typeof f.s !== "string" || typeof f.sig !== "string" || !SIG_HEX.test(f.sig)) return null;
+    if (f.to !== id.deviceId) return null;
+    const sender = roster.get(f.dev);
+    if (!sender) return null;
+    if (!ed25519.verify(hexToBytes(f.sig), directSigMessage(teamId, f.dev, f.to, f.s), hexToBytes(sender.signPub), { zip215: false })) return null;
+    const plain = openFromDevice(id, f.s);
+    if (plain === null) return null;
+    return { uid: sender.uid, login: sender.login, payload: new TextDecoder("utf-8", { fatal: true }).decode(plain) };
+  } catch {
+    return null;
+  }
+}
