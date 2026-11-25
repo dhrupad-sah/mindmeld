@@ -107,13 +107,16 @@ describe("teamcrypto", () => {
     const withCarol = new Map([...roster, [carol.deviceId, { uid: 103, login: "carol", signPub: carol.signPub }]]);
 
     it("round trip: only the recipient device opens it, and the sender comes from the roster", () => {
-      const f = sealDirect(teamId, alice, bob, '{"q":"hi"}');
+      // A long, distinctive plaintext: a short one like "hi" can appear in random base64 by chance.
+      const payload = JSON.stringify({ q: "how did the scraper get so fast" });
+      const f = sealDirect(teamId, alice, bob, payload);
       expect(f.dev).toBe(alice.deviceId);
       expect(f.to).toBe(bob.deviceId);
-      expect(f.s).not.toContain("hi");
-      expect(openDirect(teamId, f, bob, withCarol)).toEqual({ uid: 101, login: "alice", payload: '{"q":"hi"}' });
+      expect(f.s).not.toContain("scraper");
+      expect(Buffer.from(f.s, "base64").toString("latin1")).not.toContain("scraper");
+      expect(openDirect(teamId, f, bob, withCarol)).toEqual({ uid: 101, login: "alice", payload });
       // Fresh ephemeral key per seal.
-      expect(sealDirect(teamId, alice, bob, '{"q":"hi"}').s).not.toBe(f.s);
+      expect(sealDirect(teamId, alice, bob, payload).s).not.toBe(f.s);
     });
 
     it("a different device cannot open it, even when the frame is relabelled to it", () => {
