@@ -2,12 +2,13 @@ import { EventEmitter } from "node:events";
 import WebSocket from "ws";
 import { z } from "zod";
 import type { Session } from "./auth/session.js";
-import type { Channel, PayloadSender, ServerInfo } from "./channel.js";
+import type { Channel, PayloadSender, SendTarget, ServerInfo } from "./channel.js";
 import { sameRelay } from "./config.js";
 import type { DeviceIdentity } from "./identity.js";
 import { Payload, PING_INTERVAL_MS } from "./protocol.js";
-import { openFrame, sealFrame, type TeamFrame } from "./teamcrypto.js";
+import { type DirectFrame, openDirect, openFrame, sealDirect, sealFrame, type TeamFrame } from "./teamcrypto.js";
 import { distributeKeys, fetchRoster, fetchTeamKeys, httpBase, rosterDevices, WAITING_FOR_KEY } from "./teamkeys.js";
+import { VERSION } from "./version.js";
 
 export interface TeamChannelOptions {
   /** Relay base URL (http(s):// or ws(s)://). */
@@ -22,6 +23,8 @@ export interface TeamChannelOptions {
    * admitted (tests shrink it). Default 1s.
    */
   noKeyRetryMs?: number;
+  /** Client version sent to the relay as `?v=`. Defaults to this build's version. */
+  version?: string;
 }
 
 /** Shown when the relay refuses the session token (or it has expired locally). */
@@ -37,9 +40,16 @@ export function backoffDelay(failures: number, baseMs: number, maxMs: number, ra
 }
 
 /** Close codes the relay uses on team sockets. */
-export const TEAM_CLOSE = { removed: 4001, noKey: 4003, noTeam: 4004, signedOut: 4401 } as const;
+export const TEAM_CLOSE = { removed: 4001, noKey: 4003, noTeam: 4004, tooOld: 4005, signedOut: 4401 } as const;
+
+/** Shown when the relay refuses this client's version for teams (close code 4005). */
+export const tooOldForTeams = (version: string) => `mindmeld ${version} is too old for teams; update: claude plugin update mindmeld@mindmeld`;
 
 const TeamFrameSchema = z.object({ e: z.number().int(), dev: z.string(), d: z.string(), sig: z.string() });
+const DirectFrameSchema = z.object({ dev: z.string(), to: z.string(), s: z.string(), sig: z.string() });
+
+/** Payloads between two people: sealed to the recipient device and delivered only to it. */
+const DIRECTED = new Set<Payload["type"]>(["ask", "status", "answer", "decline", "snippet"]);
 
 /** What the relay sends on a team socket. `c`, `uid` and `login` are routing hints only, never identity. */
 const TeamMessage = z.discriminatedUnion("t", [
@@ -48,7 +58,10 @@ const TeamMessage = z.discriminatedUnion("t", [
   z.object({ t: z.literal("left"), c: z.string(), uid: z.number().int(), login: z.string() }),
   z.object({ t: z.literal("roster") }),
   z.object({ t: z.literal("msg"), f: TeamFrameSchema, c: z.string(), uid: z.number().int(), login: z.string() }),
+  z.object({ t: z.literal("dm"), f: DirectFrameSchema, c: z.string(), uid: z.number().int(), login: z.string() }),
 ]);
+
+type Held = ({ t: "msg"; f: TeamFrame } | { t: "dm"; f: DirectFrame }) & { c: string; uid: number };
 
 const RETRY_BASE_MS = 2000;
 const RETRY_MAX_MS = 60_000;
@@ -65,9 +78,15 @@ const MAX_HELD = 64;
 const MAX_DISTRIBUTE_PASSES = 3;
 
 /**
- * The team transport: one socket at /v1/teams/:id/ws (bearer token in the Authorization header).
- * Every frame is sealed with the current epoch's team key and signed by this device; incoming frames
- * are verified with `openFrame` against the roster, and the sender (GitHub id, and login for display) comes from that signature.
+ * The team transport: one socket at /v1/teams/:id/ws?v=<version> (bearer token in the Authorization header).
+ * Presence (hello, bye) is sealed with the current epoch's team key, signed by this device and broadcast
+ * to the team; incoming broadcasts are verified with `openFrame` against the roster. Everything between
+ * two people (ask, status, answer, decline, snippet) is sealed to the recipient device with `sealDirect`
+ * and sent as { t:"dm", to, f }, which the relay delivers only to that device; incoming ones are
+ * verified with `openDirect`. A directed payload names its recipient by peer id (resolved to the device
+ * that sent that peer's first hello) or by device (a reply to an asker); if it cannot be resolved
+ * nothing is sent and `send` returns false. Either way the sender (GitHub id, and login for display)
+ * comes from the signature.
  * The roster and verified keys are fetched on start, on reconnect, and whenever the relay says the
  * roster changed. Each fetch is followed by `distributeKeys` (see `ensureTeamKeys`): an admin creates
  * the first key, a device holding the key delivers it to roster devices that lack one, and a device
@@ -80,12 +99,15 @@ export class TeamChannel extends EventEmitter implements Channel {
   private serverInfo: ServerInfo | null = null;
   private admitted = false;
   private stopped = false;
-  private roster = new Map<string, { uid: number; login: string; signPub: string }>();
+  private roster = new Map<string, { uid: number; login: string; signPub: string; boxPub: string }>();
+  /** Peer id -> the verified device of its first hello. Never rebound or cleared: peer ids are random. */
+  private readonly peerDevice = new Map<string, string>();
   private keys = new Map<number, Uint8Array>();
   private currentEpoch = 0;
   /** Relay connection id -> the verified GitHub id of its first frame. */
   private readonly cidUid = new Map<string, number>();
-  private held: { f: TeamFrame; c: string; uid: number }[] = [];
+  /** Frames held until the next refresh: a broadcast for an unknown epoch, or a dm from a device not in the roster yet. */
+  private held: Held[] = [];
   private refreshing: Promise<void> | null = null;
   private refreshAgain = false;
   private keyProblems: string[] = [];
@@ -103,6 +125,8 @@ export class TeamChannel extends EventEmitter implements Channel {
   private finished = false;
   /** Encrypted frames this client has sent; lets tests check that idle sessions stay quiet. */
   framesSent = 0;
+  /** Frames from the relay dropped for failing a check (bad signature, wrong recipient, stamp mismatch, wrong kind...). */
+  framesDropped = 0;
 
   constructor(private readonly opts: TeamChannelOptions) {
     super();
@@ -187,12 +211,28 @@ export class TeamChannel extends EventEmitter implements Channel {
     return this.reason ?? problem ?? (this.waiting && !this.admitted ? WAITING_FOR_KEY : null);
   }
 
-  send(p: Payload): void {
-    const key = this.keys.get(this.currentEpoch);
-    if (!this.connected || !key) return;
-    const f = sealFrame(this.currentEpoch, key, this.opts.id, JSON.stringify(p));
-    this.ws!.send(JSON.stringify({ t: "msg", f }));
+  /**
+   * Presence (hello, bye) is broadcast under the team key. Any other payload must name its recipient
+   * (`to.device`, else the device behind `to.peer`) and goes only to that device; false if it names
+   * none or that device is not on the roster (nothing is sent, and never as a broadcast).
+   */
+  send(p: Payload, to?: SendTarget): boolean {
+    if (!DIRECTED.has(p.type)) {
+      const key = this.keys.get(this.currentEpoch);
+      if (!this.connected || !key) return true;
+      const f = sealFrame(this.currentEpoch, key, this.opts.id, JSON.stringify(p));
+      this.ws!.send(JSON.stringify({ t: "msg", f }));
+      this.framesSent++;
+      return true;
+    }
+    const deviceId = to?.device ?? (to?.peer !== undefined ? this.peerDevice.get(to.peer) : undefined);
+    const recipient = deviceId !== undefined ? this.roster.get(deviceId) : undefined;
+    if (deviceId === undefined || !recipient) return false;
+    if (!this.connected) return true;
+    const f = sealDirect(this.opts.teamId, this.opts.id, { deviceId, boxPub: recipient.boxPub }, JSON.stringify(p));
+    this.ws!.send(JSON.stringify({ t: "dm", to: deviceId, f }));
     this.framesSent++;
+    return true;
   }
 
   private setReason(r: string | null): void {
@@ -238,7 +278,10 @@ export class TeamChannel extends EventEmitter implements Channel {
         this.refreshing = null;
       }
       const held = this.held.splice(0);
-      for (const h of held) this.receive(h.f, h.c, h.uid, false);
+      for (const h of held) {
+        if (h.t === "msg") this.receive(h.f, h.c, h.uid, false);
+        else this.receiveDirect(h.f, h.c, h.uid, false);
+      }
     })();
     return this.refreshing;
   }
@@ -262,7 +305,8 @@ export class TeamChannel extends EventEmitter implements Channel {
       this.emit("disconnected");
     }
     this.authRefused = false;
-    const url = `${httpBase(this.opts.relayHttp).replace(/^http/, "ws")}/v1/teams/${this.opts.teamId}/ws`;
+    const v = encodeURIComponent(this.opts.version ?? VERSION);
+    const url = `${httpBase(this.opts.relayHttp).replace(/^http/, "ws")}/v1/teams/${this.opts.teamId}/ws?v=${v}`;
     // closeTimeout: once close frames are exchanged, do not wait 30s for a peer that keeps TCP half open
     // (seen with relay-initiated closes of hibernated sockets); "closed" must arrive promptly.
     const ws = new WebSocket(url, { headers: { authorization: `Bearer ${this.opts.session.token}` }, closeTimeout: CLOSE_TIMEOUT_MS } as WebSocket.ClientOptions);
@@ -300,6 +344,7 @@ export class TeamChannel extends EventEmitter implements Channel {
       if (this.authRefused) return this.terminal(TEAM_CLOSE.signedOut, SIGN_IN_EXPIRED);
       if (code === TEAM_CLOSE.removed) return this.terminal(code, "removed from team");
       if (code === TEAM_CLOSE.noTeam) return this.terminal(code, "no such team");
+      if (code === TEAM_CLOSE.tooOld) return this.terminal(code, tooOldForTeams(this.opts.version ?? VERSION));
       this.emit("closed", code, reason);
       if (code === TEAM_CLOSE.noKey) {
         this.setReason(this.waiting ? WAITING_FOR_KEY : "no team key yet");
@@ -346,35 +391,68 @@ export class TeamChannel extends EventEmitter implements Channel {
       case "msg":
         this.receive(msg.f, msg.c, msg.uid, true);
         break;
+      case "dm":
+        this.receiveDirect(msg.f, msg.c, msg.uid, true);
+        break;
     }
   }
 
   /**
-   * Verify and deliver one frame. The sender is the GitHub id the signature proves (via the roster);
+   * Verify and deliver one broadcast (team-key) frame. The sender is the GitHub id the signature proves (via the roster);
    * the relay's uid stamp must agree with it, and a connection id stays bound to the uid of its first
    * frame. The login delivered with it is the roster's, for display.
    */
   private receive(f: TeamFrame, c: string, stamped: number, mayHold: boolean): void {
     if (mayHold && !this.keys.has(f.e) && f.e > this.currentEpoch) {
       // Probably a rotation this client has not caught up with yet.
-      if (this.held.length < MAX_HELD) this.held.push({ f, c, uid: stamped });
-      void this.refresh().catch((e) => this.refreshFailed(e));
+      this.hold({ t: "msg", f, c, uid: stamped });
       return;
     }
     const opened = openFrame(f, this.keys, this.roster);
-    if (!opened) return;
-    if (opened.uid !== stamped) return;
+    // A broadcast only ever carries presence; anything else must have been sealed to its recipient.
+    if (!opened || !this.deliver(opened, f.dev, c, stamped, false)) this.framesDropped++;
+  }
+
+  /**
+   * Verify and deliver one directed frame: addressed to this device, signed by a roster device, opened
+   * with this device's key. Same stamp and connection checks as `receive`. A frame from a device the
+   * roster does not list yet (it just joined) is held for one refresh.
+   */
+  private receiveDirect(f: DirectFrame, c: string, stamped: number, mayHold: boolean): void {
+    if (f.to !== this.opts.id.deviceId) {
+      this.framesDropped++;
+      return;
+    }
+    if (mayHold && !this.roster.has(f.dev)) {
+      this.hold({ t: "dm", f, c, uid: stamped });
+      return;
+    }
+    const opened = openDirect(this.opts.teamId, f, this.opts.id, this.roster);
+    if (!opened || !this.deliver(opened, f.dev, c, stamped, true)) this.framesDropped++;
+  }
+
+  private hold(h: Held): void {
+    if (this.held.length < MAX_HELD) this.held.push(h);
+    void this.refresh().catch((e) => this.refreshFailed(e));
+  }
+
+  /** Shared tail of `receive` / `receiveDirect`: identity checks, payload parse, kind check, emit. False if dropped. */
+  private deliver(opened: { uid: number; login: string; payload: string }, device: string, c: string, stamped: number, direct: boolean): boolean {
+    if (opened.uid !== stamped) return false;
     const bound = this.cidUid.get(c);
-    if (bound !== undefined && bound !== opened.uid) return;
+    if (bound !== undefined && bound !== opened.uid) return false;
     let p: Payload;
     try {
       const parsed = Payload.safeParse(JSON.parse(opened.payload));
-      if (!parsed.success) return;
+      if (!parsed.success) return false;
       p = parsed.data;
     } catch {
-      return;
+      return false;
     }
+    if (DIRECTED.has(p.type) !== direct) return false;
     this.cidUid.set(c, opened.uid);
-    this.emit("payload", p, { cid: c, login: opened.login, uid: opened.uid } satisfies PayloadSender);
+    if (p.type === "hello" && !this.peerDevice.has(p.peer)) this.peerDevice.set(p.peer, device);
+    this.emit("payload", p, { cid: c, login: opened.login, uid: opened.uid, device } satisfies PayloadSender);
+    return true;
   }
 }

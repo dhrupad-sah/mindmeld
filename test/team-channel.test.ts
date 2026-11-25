@@ -5,6 +5,7 @@ import type { Payload } from "../src/protocol.js";
 import { openFrame, sealFrame, type TeamFrame } from "../src/teamcrypto.js";
 import { backoffDelay, SIGN_IN_EXPIRED, TeamChannel } from "../src/teamchannel.js";
 import { fetchRoster, fetchTeamKeys, WAITING_FOR_KEY } from "../src/teamkeys.js";
+import { VERSION } from "../src/version.js";
 import { signInTestUser, type TestUser } from "./helpers/signin.js";
 import { keysBody, newTeamKey } from "./helpers/teamkeys.js";
 import { startTestRelay, type TestRelay } from "./helpers/worker.js";
@@ -67,7 +68,7 @@ describe("team channel", () => {
   }
   /** A raw team socket for `u`, recording every message and its close. */
   function raw(u: TestUser, teamId: string) {
-    const ws = new WebSocket(`${relay.wsUrl}/v1/teams/${teamId}/ws`, { headers: { authorization: `Bearer ${u.token}` } });
+    const ws = new WebSocket(`${relay.wsUrl}/v1/teams/${teamId}/ws?v=${VERSION}`, { headers: { authorization: `Bearer ${u.token}` } });
     const msgs: any[] = [];
     let closed: { code: number; reason: string } | null = null;
     ws.on("message", (d) => msgs.push(JSON.parse(d.toString())));

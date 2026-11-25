@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { handleAuth } from "./auth.js";
 import { handleTeams, type TeamEnv } from "./team.js";
+import { compareVersions } from "./version.js";
 
 export { Users } from "./auth.js";
 export { Team } from "./team.js";
@@ -31,16 +32,6 @@ interface Attachment {
 const ROOM_PATH = /^\/room\/([0-9a-f]{64})$/;
 const PAIR_PATH = /^\/pair\/([a-z0-9]{4,16})$/;
 const MAX_FRAME_BYTES = 1024 * 1024;
-
-function compareVersions(a: string, b: string): number {
-  const pa = a.split(/[.-]/).map((n) => parseInt(n, 10) || 0);
-  const pb = b.split(/[.-]/).map((n) => parseInt(n, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (d !== 0) return d;
-  }
-  return 0;
-}
 
 function trySend(ws: WebSocket, msg: string): void {
   try {

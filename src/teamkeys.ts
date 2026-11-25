@@ -67,9 +67,9 @@ function verifySig(signPub: string, message: string, sig: string): boolean {
 }
 
 /** Every device in the roster, keyed by deviceId, with its owner's uid, login and role. */
-export function rosterDevices(roster: TeamRoster): Map<string, { uid: number; login: string; signPub: string; role: "admin" | "member" }> {
-  const out = new Map<string, { uid: number; login: string; signPub: string; role: "admin" | "member" }>();
-  for (const m of roster.members) for (const d of m.devices) out.set(d.deviceId, { uid: m.uid, login: m.login, signPub: d.signPub, role: m.role });
+export function rosterDevices(roster: TeamRoster): Map<string, { uid: number; login: string; signPub: string; boxPub: string; role: "admin" | "member" }> {
+  const out = new Map<string, { uid: number; login: string; signPub: string; boxPub: string; role: "admin" | "member" }>();
+  for (const m of roster.members) for (const d of m.devices) out.set(d.deviceId, { uid: m.uid, login: m.login, signPub: d.signPub, boxPub: d.boxPub, role: m.role });
   return out;
 }
 

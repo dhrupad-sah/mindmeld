@@ -2,7 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { invitesByLogin, usersByUid, verifyToken, type AuthEnv, type DeviceRecord, type TeamIndexEntry, type TeamIndexRole } from "./auth.js";
 import { addColumnIfMissing } from "./schema.js";
-import { CLOSE_NO_KEY, CLOSE_NO_TEAM, CLOSE_REMOVED, socketCaller, TeamSockets, upgradeRequest, type Admission } from "./teamsocket.js";
+import { CLOSE_NO_KEY, CLOSE_NO_TEAM, CLOSE_REMOVED, CLOSE_TOO_OLD, socketCaller, TeamSockets, tooOldReason, upgradeRequest, type Admission } from "./teamsocket.js";
+import { compareVersions } from "./version.js";
 
 /**
  * Teams on the relay: roster, invites, roles, device records, wrapped team keys per epoch and an
@@ -46,7 +47,12 @@ export interface TeamEnv extends AuthEnv {
   TEAMS: DurableObjectNamespace<Team>;
   LATEST_VERSION: string;
   MIN_VERSION: string;
+  /** Oldest client allowed on a team socket (team messages are sealed per recipient from 0.7). */
+  TEAM_MIN_VERSION?: string;
 }
+
+/** Used when the TEAM_MIN_VERSION var is not set. */
+const DEFAULT_TEAM_MIN_VERSION = "0.7.0";
 
 type Role = "admin" | "member";
 
@@ -237,7 +243,7 @@ export async function handleTeams(req: Request, env: TeamEnv, pathname: string):
         break;
       case "GET ws":
         if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") return json(426, { error: "expected a websocket" });
-        return team.fetch(upgradeRequest(caller.uid, caller.login, caller.device.deviceId));
+        return team.fetch(upgradeRequest(caller.uid, caller.login, caller.device.deviceId, new URL(req.url).searchParams.get("v")));
       case "DELETE members": {
         const login = pathLogin(m[3]);
         if (!login) return json(400, { error: "bad login" });
@@ -277,7 +283,11 @@ export class Team extends DurableObject<TeamEnv> {
 
   constructor(ctx: DurableObjectState, env: TeamEnv) {
     super(ctx, env);
-    this.sockets = new TeamSockets(ctx, () => ({ latest: env.LATEST_VERSION, minimum: env.MIN_VERSION }));
+    this.sockets = new TeamSockets(
+      ctx,
+      () => ({ latest: env.LATEST_VERSION, minimum: env.TEAM_MIN_VERSION ?? DEFAULT_TEAM_MIN_VERSION }),
+      (id) => this.deviceOwner(id) !== null,
+    );
     const sql = ctx.storage.sql;
     sql.exec("CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK (id = 1), name TEXT NOT NULL, epoch INTEGER NOT NULL)");
     // uid = GitHub's numeric user id (the identity); login = the current login, for display.
@@ -371,11 +381,13 @@ export class Team extends DurableObject<TeamEnv> {
 
   /** Team socket upgrade, reached only from handleTeams with the verified caller in internal headers. */
   async fetch(req: Request): Promise<Response> {
-    const { uid, login, deviceId } = socketCaller(req);
+    const { uid, login, deviceId, version } = socketCaller(req);
     const meta = this.meta();
     const owner = this.deviceOwner(deviceId);
+    const minimum = this.env.TEAM_MIN_VERSION ?? DEFAULT_TEAM_MIN_VERSION;
     let admit: Admission;
-    if (!meta) admit = { ok: false, code: CLOSE_NO_TEAM, reason: "no such team" };
+    if (version === null || compareVersions(version, minimum) < 0) admit = { ok: false, code: CLOSE_TOO_OLD, reason: tooOldReason(version) };
+    else if (!meta) admit = { ok: false, code: CLOSE_NO_TEAM, reason: "no such team" };
     else if (!this.roleOf(uid) || (owner !== null && owner !== uid)) admit = { ok: false, code: CLOSE_REMOVED, reason: "not a member of this team" };
     else if (owner === null || !this.hasKey(deviceId, meta.epoch)) admit = { ok: false, code: CLOSE_NO_KEY, reason: "no team key yet" };
     else admit = { ok: true, epoch: meta.epoch };

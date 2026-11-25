@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
-import type { Channel, ServerInfo } from "../src/channel.js";
+import type { Channel, SendTarget, ServerInfo } from "../src/channel.js";
 import { Daemon, type Decide } from "../src/daemon.js";
 import type { Payload } from "../src/protocol.js";
 
@@ -8,12 +8,18 @@ class FakeChannel extends EventEmitter implements Channel {
   connected = true;
   server: ServerInfo | null = null;
   sent: Payload[] = [];
+  targets: (SendTarget | undefined)[] = [];
+  /** Recipients this fake cannot reach: a send to them reports failure. */
+  unreachable = new Set<string>();
   start() {
     this.emit("connected");
   }
   async stop() {}
-  send(p: Payload) {
+  send(p: Payload, to?: SendTarget) {
+    if (to?.peer && this.unreachable.has(to.peer)) return false;
     this.sent.push(p);
+    this.targets.push(to);
+    return true;
   }
 }
 
@@ -118,6 +124,42 @@ describe("Daemon over a Channel", () => {
     expect(channel.sent.filter((p) => p.type === "decline").map((p) => (p as { reason: string }).reason)).toEqual([
       expect.stringMatching(/rate limited/),
     ]);
+    void daemon.stop();
+  });
+
+  it("addresses every directed payload: asks and snippets to the routed peer, replies to the asker's device", async () => {
+    const { channel, daemon } = setup();
+    channel.emit("payload", { type: "hello", peer: "p1", name: "bob", project: "x", v: 3 }, { cid: "c1", login: "bob", device: "bbbbbbbbbbbbbbbb" });
+    const res = daemon.ask("q?", { peer: "bob", timeoutSec: 2 });
+    const ask = channel.sent.find((p) => p.type === "ask") as Extract<Payload, { type: "ask" }>;
+    expect(channel.targets[channel.sent.indexOf(ask)]).toEqual({ peer: "p1" });
+    channel.emit("payload", { type: "answer", id: ask.id, from: "p1", text: "yes" }, { login: "bob", device: "bbbbbbbbbbbbbbbb" });
+    expect(await res).toEqual({ from: "bob", text: "yes" });
+    expect(daemon.snippet("t", "body", "bob")).toEqual({ ok: true, to: "bob" });
+    expect(channel.targets[channel.sent.findIndex((p) => p.type === "snippet")]).toEqual({ peer: "p1" });
+
+    // An incoming question: status and answer go back to the device it came from.
+    channel.emit("payload", { type: "ask", id: "q9", from: "pz", question: "?" }, { login: "alice", device: "aaaaaaaaaaaaaaaa" });
+    await new Promise((r) => setTimeout(r, 20));
+    const replies = channel.sent.map((p, i) => [p.type, channel.targets[i]] as const).filter(([, t]) => t?.device);
+    expect(replies).toEqual([
+      ["status", { device: "aaaaaaaaaaaaaaaa" }],
+      ["answer", { device: "aaaaaaaaaaaaaaaa" }],
+    ]);
+    // Presence is never addressed.
+    expect(channel.sent.map((p, i) => [p.type, channel.targets[i]]).filter(([t]) => t === "hello" || t === "bye")).toEqual(
+      channel.sent.filter((p) => p.type === "hello").map(() => ["hello", undefined]),
+    );
+    void daemon.stop();
+  });
+
+  it("an ask the channel cannot deliver fails at once with a clear error, and a snippet reports it", async () => {
+    const { channel, daemon } = setup();
+    channel.emit("payload", { type: "hello", peer: "p1", name: "bob", project: "x", v: 3 }, { cid: "c1", login: "bob" });
+    channel.unreachable.add("p1");
+    expect(await daemon.ask("q?", { peer: "bob", timeoutSec: 5 })).toEqual({ error: "can't reach bob's session right now" });
+    expect(daemon.snippet("t", "body", "bob")).toEqual({ error: "can't reach bob's session right now" });
+    expect(channel.sent.filter((p) => p.type === "ask" || p.type === "snippet")).toEqual([]);
     void daemon.stop();
   });
 });

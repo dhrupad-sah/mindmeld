@@ -14,6 +14,17 @@ export interface PayloadSender {
   login?: string;
   /** Authenticated GitHub numeric id (teams). When present, peer ownership binds to it rather than the login. */
   uid?: number;
+  /** Verified sending device (teams), so a reply can be sealed to it. */
+  device?: string;
+}
+
+/**
+ * Where a directed payload (ask, status, answer, decline, snippet) goes: the peer id it is for,
+ * or the device to seal it to (a reply to an asker, who never sends a hello). Ignored by legacy groups.
+ */
+export interface SendTarget {
+  peer?: string;
+  device?: string;
 }
 
 /**
@@ -28,7 +39,11 @@ export interface Channel extends EventEmitter {
   stop(): Promise<void>;
   readonly connected: boolean;
   readonly server: ServerInfo | null;
-  send(p: Payload): void;
+  /**
+   * Send a payload. Returns false only when a directed payload's recipient cannot be resolved
+   * (nothing was sent); a payload dropped because the socket is down still returns true.
+   */
+  send(p: Payload, to?: SendTarget): boolean;
 }
 
 export interface GroupChannelOptions {
@@ -75,11 +90,13 @@ export class GroupChannel extends EventEmitter implements Channel {
     return this.serverInfo;
   }
 
-  send(p: Payload): void {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+  /** Every member of a legacy group shares one key and gets every frame, so `to` is ignored. */
+  send(p: Payload, _to?: SendTarget): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return true;
     const frame: Frame = { t: "msg", d: seal(this.key, JSON.stringify(p)) };
     this.ws.send(JSON.stringify(frame));
     this.framesSent++;
+    return true;
   }
 
   private connect(): void {
