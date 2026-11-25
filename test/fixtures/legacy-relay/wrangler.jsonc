@@ -1,3 +1,6 @@
+// TEST FIXTURE ONLY: never deploy; shares the production worker name so local storage carries over.
+// Every request is refused unless the LEGACY_FIXTURE binding is "1", which only
+// test/team-upgrade.test.ts passes (never set it here).
 // The 0.6.0 relay's storage layout, for test/team-upgrade.test.ts. Same worker name, Durable Object
 // classes and migrations as relay-worker/wrangler.jsonc, so a persisted storage directory written by
 // this worker is what the real relay finds when it starts on it (an upgrade from 0.6.0).

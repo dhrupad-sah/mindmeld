@@ -24,6 +24,8 @@ export interface TestRelayOptions {
   config?: string;
   /** Durable Object storage directory to use, and keep on stop() (the caller removes it). */
   persist?: string;
+  /** Extra plain-text bindings for this run only. */
+  vars?: Record<string, string>;
 }
 
 /**
@@ -42,6 +44,7 @@ export async function startTestRelay(opts: TestRelayOptions = {}): Promise<TestR
       bindings: {
         GITHUB_API_BASE: { type: "plain_text", value: github.url },
         TOKEN_SIGNING_KEY: { type: "plain_text", value: TEST_TOKEN_SIGNING_KEY },
+        ...Object.fromEntries(Object.entries(opts.vars ?? {}).map(([k, value]) => [k, { type: "plain_text", value }])),
       },
       dev: {
         remote: false,

@@ -88,7 +88,15 @@ export const inviteMember = (relay: string, s: Session, teamId: string, login: s
 /** Cancel the pending invite for `login` (admins). */
 export const revokeInvite = (relay: string, s: Session, teamId: string, login: string) =>
   teamCall(relay, s, "DELETE", `/v1/teams/${teamId}/invites/${encodeURIComponent(normLogin(login))}`);
-export const acceptInvite = (relay: string, s: Session, teamId: string) => teamCall(relay, s, "POST", `/v1/teams/${teamId}/accept`);
+/** Accept an invite. A 403 (no invite for this login) means it was cancelled or already used. */
+export async function acceptInvite(relay: string, s: Session, teamId: string): Promise<unknown> {
+  try {
+    return await teamCall(relay, s, "POST", `/v1/teams/${teamId}/accept`);
+  } catch (e) {
+    if ((e as { status?: number }).status === 403) throw new TeamApiError("this invite was cancelled or already used", 403);
+    throw e;
+  }
+}
 /** Add this device to a team its login is already in (a second machine). */
 export const addDevice = (relay: string, s: Session, teamId: string) => teamCall<{ added: boolean }>(relay, s, "POST", `/v1/teams/${teamId}/devices`);
 export const deleteMember = (relay: string, s: Session, teamId: string, login: string) =>

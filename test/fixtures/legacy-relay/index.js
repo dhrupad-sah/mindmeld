@@ -1,3 +1,4 @@
+// TEST FIXTURE ONLY: never deploy; shares the production worker name so local storage carries over.
 import { DurableObject } from "cloudflare:workers";
 
 /**
@@ -51,6 +52,8 @@ export class Team extends DurableObject {
 
 export default {
   async fetch(req, env) {
+    // Refuse everything unless the test passed LEGACY_FIXTURE = "1" (never set in wrangler.jsonc).
+    if (env.LEGACY_FIXTURE !== "1") return new Response("not found", { status: 404 });
     if (new URL(req.url).pathname !== "/seed" || req.method !== "POST") return new Response("not found", { status: 404 });
     const { teamId, name, adminUid, adminLogin, invitee } = await req.json();
     const team = env.TEAMS.get(env.TEAMS.idFromName(teamId));

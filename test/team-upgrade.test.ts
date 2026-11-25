@@ -21,7 +21,15 @@ describe("upgrading a relay that has 0.6.0 team data", () => {
       const admin = { uid: 777001, login: "upgrade-admin" };
       const invitee = "upgrade-bob";
 
-      const old = await startTestRelay({ config: LEGACY, persist });
+      // Without the LEGACY_FIXTURE binding the fixture refuses everything (it must never act as a relay).
+      const locked = await startTestRelay({ config: LEGACY, persist });
+      try {
+        expect((await fetch(`${locked.url}/seed`, { method: "POST", body: "{}" })).status).toBe(404);
+      } finally {
+        await locked.stop();
+      }
+
+      const old = await startTestRelay({ config: LEGACY, persist, vars: { LEGACY_FIXTURE: "1" } });
       try {
         const res = await fetch(`${old.url}/seed`, {
           method: "POST",
