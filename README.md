@@ -33,11 +33,11 @@ A team is a group of people who sign in with GitHub. Each machine gets its own k
 1. **Sign in, everyone, once:** `/mindmeld:login`. Claude shows a code and a link. Open the link, enter the code, approve on GitHub. Sign-in finishes on its own and `/mindmeld:status` shows who you are. It lasts 7 days, then you sign in again.
 2. **Create a team (an admin):** `/mindmeld:team create core`. You're its first admin and this machine is connected to it.
 3. **Invite by GitHub username:** `/mindmeld:team invite sarim-dev`. Claude gives you a short message to send them.
-4. **They sign in and accept:** they install the plugin, run `/mindmeld:login`, then `/mindmeld:team accept core`. Their machine gets the team key the next time a teammate is online. `/mindmeld:status` shows "waiting" until then.
+4. **They sign in and accept:** they install the plugin, run `/mindmeld:login`, then `/mindmeld:team accept core`. `/mindmeld:team accept` on its own joins nothing: it lists their pending invites and who sent each one. Their machine gets the team key the next time a teammate is online. `/mindmeld:status` shows "waiting" until then.
 5. **Share a session:** `/mindmeld:share scraper work`, same as before. Sessions stay private until you do this.
 6. **Ask:** *"ask sarim-dev how they got the scraper so fast"*. Approval dialogs, the read-only fork and "always allow" work as described below.
 
-`/mindmeld:team` on its own shows the members, roles, pending invites, and each device's key fingerprint and whether it has the team key. `/mindmeld:team role <login> admin|member` changes a role.
+`/mindmeld:team` on its own shows the members, roles, pending invites (and who sent them), and each device's key fingerprint and whether it has the team key. `/mindmeld:team role <login> admin|member` changes a role. `/mindmeld:team uninvite <login>` cancels a pending invite (admins only).
 
 **Removing someone:** `/mindmeld:team remove sarim-dev` (admins only). A dialog asks you to confirm. Then their devices are disconnected right away and the team key is rotated for everyone left. They keep whatever they already received, but not anything sent after.
 

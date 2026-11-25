@@ -75,6 +75,8 @@ export interface TeamEntry {
   teamId: string;
   name: string;
   role: "admin" | "member" | "invited";
+  /** Invited entries: the inviting admin's login (null or missing when the relay doesn't know). */
+  invitedBy?: string | null;
 }
 
 export const createTeam = (relay: string, s: Session, name: string) => teamCall<{ teamId: string }>(relay, s, "POST", "/v1/teams", { name });
@@ -83,6 +85,9 @@ export const getRoster = (relay: string, s: Session, teamId: string, timeoutMs?:
   teamCall<TeamRoster>(relay, s, "GET", `/v1/teams/${teamId}`, undefined, timeoutMs);
 export const inviteMember = (relay: string, s: Session, teamId: string, login: string) =>
   teamCall(relay, s, "POST", `/v1/teams/${teamId}/invites`, { login: normLogin(login) });
+/** Cancel the pending invite for `login` (admins). */
+export const revokeInvite = (relay: string, s: Session, teamId: string, login: string) =>
+  teamCall(relay, s, "DELETE", `/v1/teams/${teamId}/invites/${encodeURIComponent(normLogin(login))}`);
 export const acceptInvite = (relay: string, s: Session, teamId: string) => teamCall(relay, s, "POST", `/v1/teams/${teamId}/accept`);
 /** Add this device to a team its login is already in (a second machine). */
 export const addDevice = (relay: string, s: Session, teamId: string) => teamCall<{ added: boolean }>(relay, s, "POST", `/v1/teams/${teamId}/devices`);
@@ -129,6 +134,54 @@ export function inviteMessage(login: string, teamName: string): string {
   ].join("\n");
 }
 
+/** "invited by @alice", or "invited by an admin" when the relay doesn't know who. */
+export const invitedByText = (t: { invitedBy?: string | null }) => `invited by ${t.invitedBy ? `@${t.invitedBy}` : "an admin"}`;
+
+/** What accepting should do: join an invite, switch to a team already joined, or answer with text. */
+export type AcceptPlan = { join: TeamEntry } | { use: TeamEntry } | { text: string; isError: boolean };
+
+/**
+ * Decide what `accept [team]` does with the caller's teams and invites. With no team named it never
+ * joins anything: pending invites are listed with who sent them; only when there are none and the
+ * caller is in exactly one team does it switch to that team. `acceptCmd` is how the user accepts
+ * ("/mindmeld:team accept" or "mindmeld team accept").
+ */
+export function planAccept(teams: TeamEntry[], query: string | undefined, login: string, acceptCmd: string): AcceptPlan {
+  const describe = (t: TeamEntry) => (t.role === "invited" ? `invite to "${t.name}" (${invitedByText(t)})` : `team "${t.name}" (${t.role})`);
+  const q = query?.trim().toLowerCase();
+  if (q) {
+    const match = teams.filter((t) => t.teamId === q || t.name.toLowerCase() === q);
+    if (match.length === 0) {
+      return {
+        text: teams.length ? `No invite to or team called "${query!.trim()}". Yours: ${teams.map(describe).join(", ")}.` : noInvites(login),
+        isError: true,
+      };
+    }
+    if (match.length > 1) {
+      return { text: `Several have that name: ${match.map((t) => `${describe(t)} (${t.teamId})`).join(", ")}. Say which by its id, e.g. ${acceptCmd} ${match[0].teamId}`, isError: true };
+    }
+    return match[0].role === "invited" ? { join: match[0] } : { use: match[0] };
+  }
+  const pending = teams.filter((t) => t.role === "invited");
+  if (pending.length) {
+    const collides = (t: TeamEntry) => teams.filter((o) => o.name.toLowerCase() === t.name.toLowerCase()).length > 1;
+    return {
+      text: [
+        pending.length === 1 ? "You have a pending team invite:" : `You have ${pending.length} pending team invites:`,
+        ...pending.map((t) => `- ${t.name}${collides(t) ? ` (${t.teamId})` : ""}: ${invitedByText(t)}`),
+        "",
+        `Nothing was accepted. To join, run ${acceptCmd} <name>${pending.some(collides) ? " (use the team id when two share a name)" : ""}, e.g. ${acceptCmd} ${collides(pending[0]) ? pending[0].teamId : pending[0].name}`,
+      ].join("\n"),
+      isError: false,
+    };
+  }
+  if (teams.length === 0) return { text: noInvites(login), isError: true };
+  if (teams.length === 1) return { use: teams[0] };
+  return { text: `You're in ${teams.map((t) => `${describe(t)} (${t.teamId})`).join(", ")}. Which one? Say which, e.g. ${acceptCmd} ${teams[0].name}`, isError: true };
+}
+
+const noInvites = (login: string) => `No pending invites for @${login}. Ask a team admin to invite your GitHub login (@${login}).`;
+
 const roleText = (roster: TeamRoster, uid: number) => roster.members.find((m) => m.uid === uid)?.role;
 
 /** "Team: core (you're admin)". `uid` is the signed-in GitHub id. */
@@ -146,6 +199,7 @@ const EVENTS: Record<string, (by: string, subject: string) => string> = {
   rotated: (by, s) => `${by} rotated the team key (epoch ${s})`,
   removed: (by, s) => `${by} removed ${s}`,
   role: (by, s) => `${by} changed the role of ${s}`,
+  "invite-revoked": (by, s) => `${by} cancelled the invite for ${s}`,
 };
 
 /** The `team` tool's text: members, roles, devices (fingerprint, key), invites and the recent log. */
@@ -159,7 +213,10 @@ export function formatTeam(roster: TeamRoster, me: { uid: number; deviceId: stri
       lines.push(`    device ${fingerprint(d.signPub)}: ${key}${d.deviceId === me.deviceId ? " (this device)" : ""}`);
     }
   }
-  lines.push("", `Pending invites: ${roster.invites.length ? roster.invites.map((l) => `@${l}`).join(", ") : "none"}`);
+  // inviteDetails (relays from 0.6.1) says who invited; older relays send only the logins.
+  const invites = roster.inviteDetails ?? roster.invites.map((login) => ({ login, invitedBy: null }));
+  const inviteText = (i: { login: string; invitedBy: string | null }) => `@${i.login}${i.invitedBy ? ` (invited by @${i.invitedBy})` : ""}`;
+  lines.push("", `Pending invites: ${invites.length ? invites.map(inviteText).join(", ") : "none"}`);
   const log = (roster.log as LogEntry[]).slice(-20).reverse();
   lines.push("", "Recent activity:");
   if (log.length === 0) lines.push("- none");

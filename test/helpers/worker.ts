@@ -19,18 +19,26 @@ export interface TestRelay {
 const WORKER_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "relay-worker");
 export const TEST_TOKEN_SIGNING_KEY = "00".repeat(32);
 
+export interface TestRelayOptions {
+  /** wrangler config to run instead of relay-worker/wrangler.jsonc (e.g. a legacy-schema fixture). */
+  config?: string;
+  /** Durable Object storage directory to use, and keep on stop() (the caller removes it). */
+  persist?: string;
+}
+
 /**
  * Runs relay-worker/src/index.ts locally (workerd via wrangler's unstable_startWorker) with the
  * GitHub API pointed at an in-process mock. Local only: nothing remote, nothing deployed.
- * Each call gets its own Durable Object storage directory, removed on stop().
+ * Each call gets its own Durable Object storage directory, removed on stop(), unless `persist` is given.
  */
-export async function startTestRelay(): Promise<TestRelay> {
+export async function startTestRelay(opts: TestRelayOptions = {}): Promise<TestRelay> {
   const github = await startGithubMock();
-  const persist = await mkdtemp(join(tmpdir(), "mindmeld-relay-test-"));
+  const persist = opts.persist ?? (await mkdtemp(join(tmpdir(), "mindmeld-relay-test-")));
+  const cleanup = () => (opts.persist ? Promise.resolve() : rm(persist, { recursive: true, force: true }));
   let worker: Awaited<ReturnType<typeof startWorker>> | undefined;
   try {
     worker = await startWorker({
-      config: join(WORKER_DIR, "wrangler.jsonc"),
+      config: opts.config ?? join(WORKER_DIR, "wrangler.jsonc"),
       bindings: {
         GITHUB_API_BASE: { type: "plain_text", value: github.url },
         TOKEN_SIGNING_KEY: { type: "plain_text", value: TEST_TOKEN_SIGNING_KEY },
@@ -53,13 +61,13 @@ export async function startTestRelay(): Promise<TestRelay> {
       stop: async () => {
         await worker!.dispose();
         await github.stop();
-        await rm(persist, { recursive: true, force: true });
+        await cleanup();
       },
     };
   } catch (err) {
     await worker?.dispose().catch(() => {});
     await github.stop();
-    await rm(persist, { recursive: true, force: true });
+    await cleanup();
     throw err;
   }
 }

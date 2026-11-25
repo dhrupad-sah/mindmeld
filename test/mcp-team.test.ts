@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { exchange } from "../src/auth/session.js";
 import { fingerprint, loadOrCreateIdentity, type DeviceIdentity } from "../src/identity.js";
-import { githubBase, removeAndRotate } from "../src/teamapi.js";
+import { githubBase, planAccept, removeAndRotate, type TeamEntry } from "../src/teamapi.js";
 import { WAITING_FOR_KEY } from "../src/teamkeys.js";
 import { startServer } from "./helpers/mcpserver.js";
 import { startTestRelay, type TestRelay } from "./helpers/worker.js";
@@ -101,7 +101,7 @@ describe("team tools over MCP", () => {
     // Nobody holding the key is online, so bob waits for it.
     sa.stop();
     const sb = server(b.dir);
-    expect(await sb.call("accept_invite")).toContain('Joined team "core"');
+    expect(await sb.call("accept_invite", { team: "core" })).toContain('Joined team "core"');
     st = await until(sb, "status", WAITING_FOR_KEY);
     expect(st).toContain(`Signed in: @${bob}`);
     expect(st).toContain("Team: core (you're member)");
@@ -140,7 +140,7 @@ describe("team tools over MCP", () => {
     expect(await sa.call("create_team", { name: "core" })).toContain("Created team");
     await sa.call("invite_member", { login: bob });
     const sb = server(b.dir);
-    expect(await sb.call("accept_invite")).toContain("Joined team");
+    expect(await sb.call("accept_invite", { team: "core" })).toContain("Joined team");
 
     expect(await sa.call("remove_member", { login: bob, confirmed: true })).toContain(`@${bob} stays in the team`);
     expect(sa.dialogs).toHaveLength(1);
@@ -157,7 +157,7 @@ describe("team tools over MCP", () => {
     await sa.call("create_team", { name: "core" });
     await sa.call("invite_member", { login: bob });
     const sb = server(b.dir);
-    await sb.call("accept_invite");
+    await sb.call("accept_invite", { team: "core" });
 
     const configPath = join(b.dir, "config.json");
     expect(await sb.call("leave_group", { confirmed: true })).toContain("leaving a team isn't supported yet");
@@ -204,9 +204,63 @@ describe("team tools over MCP", () => {
     expect(JSON.parse(readFileSync(join(a.dir, "config.json"), "utf8")).trusted ?? []).toEqual([]);
     await sa.call("invite_member", { login: bob });
     const sb = server(b.dir);
-    expect(await sb.call("accept_invite")).toContain("Joined team");
+    expect(await sb.call("accept_invite", { team: "core" })).toContain("Joined team");
     expect(JSON.parse(readFileSync(join(b.dir, "config.json"), "utf8")).trusted ?? []).toEqual([]);
     expect(await until(sb, "status", "Team: core")).toContain("Always allowed (answered without dialogs): nobody");
+  }, 60_000);
+
+  it("accept_invite with no team lists invites and who sent them; naming the team joins", async () => {
+    const alice = unique("alice");
+    const bob = unique("bob");
+    const a = await home(alice);
+    const b = await home(bob);
+    const sa = server(a.dir);
+    expect(await sa.call("create_team", { name: "core" })).toContain("Created team");
+    await sa.call("invite_member", { login: bob });
+    expect(await sa.call("team")).toContain(`Pending invites: @${bob} (invited by @${alice})`);
+
+    const sb = server(b.dir);
+    const listed = await sb.reply("accept_invite", {});
+    expect(listed.text).toContain(`core: invited by @${alice}`);
+    expect(listed.text).toContain("/mindmeld:team accept core");
+    expect(listed.text).not.toContain("Joined");
+    expect(JSON.parse(readFileSync(join(b.dir, "config.json"), "utf8")).team).toBeUndefined();
+    expect(await sa.call("team")).toContain(`Pending invites: @${bob}`); // still only invited
+
+    const joined = await sb.call("accept_invite", { team: "core" });
+    expect(joined).toContain('Joined team "core"');
+    expect(joined).toContain(`invited by @${alice}`);
+    // In one team and no invites: no argument selects it, as before.
+    expect(await sb.call("accept_invite")).toContain('now uses team "core"');
+  }, 60_000);
+
+  it("revoke_invite cancels an invite (admins only)", async () => {
+    const alice = unique("alice");
+    const bob = unique("bob");
+    const carol = unique("carol");
+    const a = await home(alice);
+    const b = await home(bob);
+    const c = await home(carol);
+    const sa = server(a.dir);
+    await sa.call("create_team", { name: "core" });
+    await sa.call("invite_member", { login: bob });
+    await sa.call("invite_member", { login: carol });
+    const sb = server(b.dir);
+    expect(await sb.call("accept_invite", { team: "core" })).toContain("Joined team");
+    const denied = await sb.reply("revoke_invite", { login: carol });
+    expect(denied.isError).toBe(true);
+    expect(denied.text).toContain("admins only");
+
+    expect(await sa.call("revoke_invite", { login: carol })).toContain(`Cancelled the invite for @${carol}`);
+    const again = await sa.reply("revoke_invite", { login: carol });
+    expect(again.isError).toBe(true);
+    expect(again.text).toContain(`@${carol} has no pending invite`);
+    const t = await sa.call("team");
+    expect(t).toContain("Pending invites: none");
+    expect(t).toContain(`${alice} cancelled the invite for ${carol}`);
+
+    const sc = server(c.dir);
+    expect(await sc.call("accept_invite")).toContain(`No pending invites for @${carol}`);
   }, 60_000);
 
   it("join_peer and invite_peer refuse while a team is set, and change nothing", async () => {
@@ -287,5 +341,37 @@ describe("removeAndRotate", () => {
     expect(rotated).toBe(false);
     expect(r.isError).toBe(true);
     expect(r.text).toContain("Could not remove @bob: relay: admins only");
+  });
+});
+
+describe("planAccept", () => {
+  const cmd = "/mindmeld:team accept";
+  const core: TeamEntry = { teamId: "aaaaaaaaaaaaaaaa", name: "core", role: "invited", invitedBy: "alice" };
+  it("never joins without a team named, even with exactly one invite", () => {
+    const p = planAccept([core], undefined, "bob", cmd);
+    expect(p).toEqual({ text: expect.stringContaining("- core: invited by @alice"), isError: false });
+    expect((p as { text: string }).text).toContain(`${cmd} core`);
+  });
+  it("lists invites (not the team) when also in a team; an unknown inviter reads as an admin", () => {
+    const mine: TeamEntry = { teamId: "bbbbbbbbbbbbbbbb", name: "infra", role: "member" };
+    const old: TeamEntry = { teamId: "cccccccccccccccc", name: "web", role: "invited", invitedBy: null };
+    const p = planAccept([mine, old], undefined, "bob", cmd) as { text: string };
+    expect(p.text).toContain("- web: invited by an admin");
+    expect(p.text).not.toContain("infra");
+  });
+  it("shows team ids when names collide", () => {
+    const other: TeamEntry = { teamId: "dddddddddddddddd", name: "Core", role: "invited", invitedBy: "carol" };
+    const p = planAccept([core, other], undefined, "bob", cmd) as { text: string };
+    expect(p.text).toContain(`- core (${core.teamId}): invited by @alice`);
+    expect(p.text).toContain(`- Core (${other.teamId}): invited by @carol`);
+    expect(planAccept([core, other], "core", "bob", cmd)).toMatchObject({ isError: true });
+    expect(planAccept([core, other], other.teamId, "bob", cmd)).toEqual({ join: other });
+  });
+  it("switches to the only team when there are no invites, and joins a named invite", () => {
+    const mine: TeamEntry = { teamId: "bbbbbbbbbbbbbbbb", name: "infra", role: "admin" };
+    expect(planAccept([mine], undefined, "bob", cmd)).toEqual({ use: mine });
+    expect(planAccept([mine, { ...mine, teamId: "eeeeeeeeeeeeeeee", name: "two" }], undefined, "bob", cmd)).toMatchObject({ isError: true });
+    expect(planAccept([], undefined, "bob", cmd)).toEqual({ text: expect.stringContaining("No pending invites for @bob"), isError: true });
+    expect(planAccept([mine, core], "CORE", "bob", cmd)).toEqual({ join: core });
   });
 });

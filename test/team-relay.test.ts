@@ -88,8 +88,9 @@ describe("team relay", () => {
     const teamId = await createTeam(alice, "infra");
     // Logins are case-insensitive.
     expect((await call(alice, "POST", `/v1/teams/${teamId}/invites`, { login: bob.login.toUpperCase() })).status).toBe(200);
-    expect((await call(bob, "GET", "/v1/teams")).body).toEqual([{ teamId, name: "infra", role: "invited" }]);
+    expect((await call(bob, "GET", "/v1/teams")).body).toEqual([{ teamId, name: "infra", role: "invited", invitedBy: alice.login }]);
     expect((await roster(alice, teamId)).invites).toEqual([bob.login]);
+    expect((await roster(alice, teamId)).inviteDetails).toEqual([{ login: bob.login, invitedBy: alice.login }]);
     expect((await call(bob, "GET", `/v1/teams/${teamId}`)).status).toBe(403);
     expect((await call(bob, "POST", `/v1/teams/${teamId}/accept`)).status).toBe(200);
     const r = await roster(bob, teamId);
@@ -102,6 +103,51 @@ describe("team relay", () => {
     });
     expect((await call(bob, "GET", "/v1/teams")).body).toEqual([{ teamId, name: "infra", role: "member" }]);
     expect((await call(bob, "GET", `/v1/teams/${teamId}/keys`)).body).toEqual({ epoch: 0, wrapped: null, epochs: {} });
+  });
+
+  it("invites show who sent them: invitedBy for the invitee, inviteDetails in the roster", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const carol = await user("carol");
+    const teamId = await createTeam(alice);
+    await join(alice, teamId, bob);
+    expect((await call(alice, "POST", `/v1/teams/${teamId}/roles`, { login: bob.login, role: "admin" })).status).toBe(200);
+    expect((await call(bob, "POST", `/v1/teams/${teamId}/invites`, { login: carol.login })).status).toBe(200);
+    // Inviting again (another admin) keeps the original inviter.
+    expect((await call(alice, "POST", `/v1/teams/${teamId}/invites`, { login: carol.login })).status).toBe(200);
+    expect((await call(carol, "GET", "/v1/teams")).body).toEqual([{ teamId, name: "core", role: "invited", invitedBy: bob.login }]);
+    const r = await roster(alice, teamId);
+    // 0.6.0 clients read `invites` as a list of logins: it stays exactly that.
+    expect(r.invites).toEqual([carol.login]);
+    expect(r.inviteDetails).toEqual([{ login: carol.login, invitedBy: bob.login }]);
+    // Member entries carry no invitedBy.
+    expect((await call(bob, "GET", "/v1/teams")).body).toEqual([{ teamId, name: "core", role: "admin" }]);
+  });
+
+  it("an admin can cancel an invite; members can't; unknown invites are 404", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const carol = await user("carol");
+    const teamId = await createTeam(alice);
+    await join(alice, teamId, bob);
+    expect((await call(alice, "POST", `/v1/teams/${teamId}/invites`, { login: carol.login })).status).toBe(200);
+    expect((await call(bob, "DELETE", `/v1/teams/${teamId}/invites/${carol.login}`)).status).toBe(403);
+    expect((await call(carol, "DELETE", `/v1/teams/${teamId}/invites/${carol.login}`)).status).toBe(403);
+    expect((await call(alice, "DELETE", `/v1/teams/${teamId}/invites/nobody-here`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/teams/${teamId}/invites/bad_login`)).status).toBe(400);
+    expect((await call(alice, "GET", `/v1/teams/${teamId}/invites/${carol.login}`)).status).toBe(405);
+    expect((await call(alice, "DELETE", `/v1/teams/${teamId}/invites/${carol.login.toUpperCase()}`)).status).toBe(200);
+    expect((await call(carol, "GET", "/v1/teams")).body).toEqual([]);
+    expect((await call(carol, "POST", `/v1/teams/${teamId}/accept`)).status).toBe(403);
+    const r = await roster(alice, teamId);
+    expect(r.invites).toEqual([]);
+    expect(r.inviteDetails).toEqual([]);
+    expect(r.log.map((e: any) => [e.by, e.event, e.subject]).slice(-1)).toEqual([[alice.login, "invite-revoked", carol.login]]);
+    expect((await call(alice, "DELETE", `/v1/teams/${teamId}/invites/${carol.login}`)).status).toBe(404);
+    // The other routes still work.
+    expect((await call(alice, "DELETE", `/v1/teams/${teamId}/members/${bob.login}`)).status).toBe(200);
+    expect((await call(alice, "POST", `/v1/teams/${teamId}/invites`, { login: carol.login })).status).toBe(200);
+    expect((await call(carol, "POST", `/v1/teams/${teamId}/accept`)).status).toBe(200);
   });
 
   it("member cannot invite", async () => {

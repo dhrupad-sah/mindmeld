@@ -27,7 +27,7 @@ describe("plugin bundle", () => {
     const tools = msgs.find((m) => m.id === 2).result.tools.map((t: { name: string }) => t.name);
     expect(tools).toEqual(expect.arrayContaining(["share_session", "stop_sharing", "status", "ask_peer", "invite_peer", "join_peer"]));
     expect(Date.now() - started).toBeLessThan(3000); // starts fast: nothing to download
-    expect(tools).toEqual(expect.arrayContaining(["login", "create_team", "invite_member", "accept_invite", "team", "remove_member", "set_role"]));
+    expect(tools).toEqual(expect.arrayContaining(["login", "create_team", "invite_member", "accept_invite", "team", "remove_member", "set_role", "revoke_invite"]));
   });
 });
 

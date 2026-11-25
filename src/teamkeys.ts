@@ -30,6 +30,8 @@ export interface TeamRoster {
   epoch: number;
   members: RosterMember[];
   invites: string[];
+  /** Who sent each pending invite (relays from 0.6.1; invitedBy is null for invites made before). */
+  inviteDetails?: { login: string; invitedBy: string | null }[];
   log: unknown[];
 }
 

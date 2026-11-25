@@ -13,9 +13,12 @@ import {
   getRoster,
   inviteMember,
   inviteMessage,
+  invitedByText,
   listTeams,
   normLogin,
+  planAccept,
   removeAndRotate,
+  revokeInvite,
   setRole,
   signIn,
   signInLine,
@@ -29,8 +32,8 @@ import { rotate, type TeamRoster } from "./teamkeys.js";
 
 const NO_TEAM = "You're not in a team yet. Create one with create_team, or accept an invite with accept_invite.";
 
-/** "invite to "core"" or "team "core" (member)". */
-const describeEntry = (t: TeamEntry) => (t.role === "invited" ? `invite to "${t.name}"` : `team "${t.name}" (${t.role})`);
+/** "invite to "core" (invited by @alice)" or "team "core" (member)". */
+const describeEntry = (t: TeamEntry) => (t.role === "invited" ? `invite to "${t.name}" (${invitedByText(t)})` : `team "${t.name}" (${t.role})`);
 
 const text = (t: string, isError = false) => ({ content: [{ type: "text" as const, text: t }], isError });
 
@@ -48,7 +51,7 @@ type ReadyTeam = Ready & { config: Config; team: NonNullable<Config["team"]> };
 
 /**
  * GitHub sign-in and teams for the MCP server: registers login, create_team, invite_member,
- * accept_invite, team, remove_member and set_role, and builds the TeamChannel when config.json has a
+ * revoke_invite, accept_invite, team, remove_member and set_role, and builds the TeamChannel when config.json has a
  * team. Every tool answers with sign-in guidance when the session is missing or expired.
  */
 export function setupTeams(host: TeamHost) {
@@ -244,41 +247,52 @@ export function setupTeams(host: TeamHost) {
   );
 
   server.registerTool(
+    "revoke_invite",
+    {
+      title: "Cancel an invite",
+      description: "Cancel a pending invite to the team (admins only), so that GitHub login can no longer accept it. Only when the user asks.",
+      inputSchema: { login: z.string().min(1).describe("The invited GitHub login") },
+    },
+    async ({ login: who }) => {
+      const r = ready(true);
+      if (typeof r === "string") return text(r, true);
+      const target = normLogin(who);
+      try {
+        await revokeInvite(r.relay, r.session, r.team.teamId, target);
+      } catch (e) {
+        if ((e as { status?: number }).status === 404) return text(`@${target} has no pending invite to team "${r.team.name}".`, true);
+        return text((e as Error).message, true);
+      }
+      return text(`Cancelled the invite for @${target} to team "${r.team.name}". They can no longer accept it.`);
+    },
+  );
+
+  server.registerTool(
     "accept_invite",
     {
       title: "Accept a team invite (or use a team you're in)",
       description:
-        "Accept an invite to a mindmeld team and connect this machine to it. Also connects this machine to a team the user already belongs to. " +
-        "Optional team name or id when there are several.",
-      inputSchema: { team: z.string().optional().describe("Team name or id, if there is more than one") },
+        "Accept an invite to a mindmeld team and connect this machine to it, or connect this machine to a team the user already belongs to. " +
+        "Without a team it never joins anything: it lists pending invites and who sent each one, so the user can choose. " +
+        "Pass the team name or id (only one the user named) to accept that invite.",
+      inputSchema: { team: z.string().optional().describe("Team name or id, as the user named it") },
     },
     async ({ team }) => {
       const r = ready(false);
       if (typeof r === "string") return text(r, true);
       return attempt(async () => {
-        const teams = await listTeams(r.relay, r.session);
-        const q = team?.trim().toLowerCase();
-        const match = q ? teams.filter((t) => t.teamId === q || t.name.toLowerCase() === q) : teams;
-        if (match.length === 0) {
-          return text(
-            q && teams.length
-              ? `No invite to or team called "${team}". Yours: ${teams.map(describeEntry).join(", ")}.`
-              : `No pending invites for @${r.session.login}. Ask a team admin to invite your GitHub login (@${r.session.login}).`,
-            true,
-          );
-        }
-        if (match.length > 1) {
-          return text(`You have ${match.map((t) => `${describeEntry(t)} (${t.teamId})`).join(", ")}. Which one? Call accept_invite with team set.`, true);
-        }
-        const t = match[0];
-        if (t.role !== "invited") {
+        const plan = planAccept(await listTeams(r.relay, r.session), team, r.session.login, "/mindmeld:team accept");
+        if ("text" in plan) return text(plan.text, plan.isError);
+        if ("use" in plan) {
+          const t = plan.use;
           const replaced = useTeam(r, { teamId: t.teamId, name: t.name });
           return text(`This machine now uses team "${t.name}", where you're ${t.role}.${replaced}`);
         }
+        const t = plan.join;
         await acceptInvite(r.relay, r.session, t.teamId);
         const replaced = useTeam(r, { teamId: t.teamId, name: t.name });
         return text(
-          `Joined team "${t.name}" as @${r.session.login}.${replaced}\n` +
+          `Joined team "${t.name}" as @${r.session.login} (${invitedByText(t)}).${replaced}\n` +
             "A teammate's mindmeld gives this device the team key the next time one of them is online; /mindmeld:status shows progress. " +
             "Your sessions stay private until you run /mindmeld:share in one.",
         );
