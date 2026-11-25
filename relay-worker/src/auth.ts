@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { ed25519 } from "@noble/curves/ed25519.js";
+import { addColumnIfMissing } from "./schema.js";
 import type { Team } from "./team.js";
 
 /**
@@ -60,11 +61,12 @@ export const isUid = (v: unknown): v is number => typeof v === "number" && Numbe
 /** A login's standing in a team, as kept in its Users index. */
 export type TeamIndexRole = "admin" | "member" | "invited";
 
-/** One row of a login's team index (GET /v1/teams). */
+/** One row of a login's team index (GET /v1/teams). Invited entries say who invited (null: unknown, from before 0.6.1). */
 export interface TeamIndexEntry {
   teamId: string;
   name: string;
   role: TeamIndexRole;
+  invitedBy?: string | null;
 }
 
 function json(status: number, body: unknown): Response {
@@ -286,21 +288,38 @@ export class Users extends DurableObject<AuthEnv> {
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
     // Index of this login's teams for GET /v1/teams. The Team Durable Object is the source of truth.
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS teams (team_id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL)");
+    // invited_by (0.6.1): who sent an "invited" entry. Rows from before it keep NULL.
+    addColumnIfMissing(ctx.storage.sql, "teams", "invited_by", "TEXT");
   }
 
-  /** Record this account's (or, for a "login:" object, this login's) role in a team ("admin", "member" or "invited"), or drop the entry when role is null. */
-  setTeam(teamId: string, name: string, role: TeamIndexRole | null): void {
+  /**
+   * Record this account's (or, for a "login:" object, this login's) role in a team ("admin", "member"
+   * or "invited", with the inviter's login), or drop the entry when role is null.
+   */
+  setTeam(teamId: string, name: string, role: TeamIndexRole | null, invitedBy?: string): void {
     const sql = this.ctx.storage.sql;
     if (role === null) sql.exec("DELETE FROM teams WHERE team_id = ?", teamId);
-    else sql.exec("INSERT INTO teams (team_id, name, role) VALUES (?, ?, ?) ON CONFLICT(team_id) DO UPDATE SET name = excluded.name, role = excluded.role", teamId, name, role);
+    else {
+      sql.exec(
+        "INSERT INTO teams (team_id, name, role, invited_by) VALUES (?, ?, ?, ?) ON CONFLICT(team_id) DO UPDATE SET name = excluded.name, role = excluded.role, invited_by = excluded.invited_by",
+        teamId,
+        name,
+        role,
+        role === "invited" ? (invitedBy ?? null) : null,
+      );
+    }
   }
 
   /** This login's teams and invitations, as last recorded by the Team objects. */
   teams(): TeamIndexEntry[] {
     return this.ctx.storage.sql
-      .exec<{ team_id: string; name: string; role: string }>("SELECT team_id, name, role FROM teams ORDER BY rowid")
+      .exec<{ team_id: string; name: string; role: string; invited_by: string | null }>("SELECT team_id, name, role, invited_by FROM teams ORDER BY rowid")
       .toArray()
-      .map((r) => ({ teamId: r.team_id, name: r.name, role: r.role as TeamIndexRole }));
+      .map((r) =>
+        r.role === "invited"
+          ? { teamId: r.team_id, name: r.name, role: "invited" as const, invitedBy: r.invited_by ?? null }
+          : { teamId: r.team_id, name: r.name, role: r.role as TeamIndexRole },
+      );
   }
 
   /** Record (or refresh) a device. False if that deviceId is already here with different keys. */

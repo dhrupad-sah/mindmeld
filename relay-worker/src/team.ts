@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { invitesByLogin, usersByUid, verifyToken, type AuthEnv, type DeviceRecord, type TeamIndexEntry, type TeamIndexRole } from "./auth.js";
+import { addColumnIfMissing } from "./schema.js";
 import { CLOSE_NO_KEY, CLOSE_NO_TEAM, CLOSE_REMOVED, socketCaller, TeamSockets, upgradeRequest, type Admission } from "./teamsocket.js";
 
 /**
@@ -8,12 +9,15 @@ import { CLOSE_NO_KEY, CLOSE_NO_TEAM, CLOSE_REMOVED, socketCaller, TeamSockets, 
  * append-only membership log. One Team Durable Object per team (keyed by its 16-hex teamId).
  * Every route needs `Authorization: Bearer <token>` (401 without a valid one).
  * - POST /v1/teams { name } -> { teamId }; the caller becomes admin.
- * - GET /v1/teams -> [{ teamId, name, role | "invited" }]: memberships from the caller's account
- *   index plus pending invites addressed to the caller's current login.
- * - GET /v1/teams/:id -> { name, epoch, members: [{ uid, login, role, devices }], invites, log } (members only).
+ * - GET /v1/teams -> [{ teamId, name, role | "invited", invitedBy? }]: memberships from the caller's
+ *   account index plus pending invites addressed to the caller's current login. Invited entries carry
+ *   `invitedBy`, the inviting admin's login at invite time (null for invites made before 0.6.1).
+ * - GET /v1/teams/:id -> { name, epoch, members: [{ uid, login, role, devices }], invites: string[],
+ *   inviteDetails: [{ login, invitedBy }], log } (members only).
  * - POST /v1/teams/:id/invites { login } (admin); POST /v1/teams/:id/accept (invited caller).
  *   Invites name a login (what admins type); accepting binds the membership to the accepting
  *   caller's GitHub id, so only the account holding that login at accept time gets in.
+ * - DELETE /v1/teams/:id/invites/:login (admin): cancel a pending invite (404 if there is none).
  * - POST /v1/teams/:id/devices (member): add the caller's current device.
  * - PUT /v1/teams/:id/keys { epoch, wrapped: { [deviceId]: { sealed, sig } }, commit?: { hash, sig } } (member).
  *   Each wrap's `sig` is Ed25519 by the caller's device over
@@ -58,8 +62,8 @@ export interface TeamResult {
   status: number;
   body: unknown;
   name?: string;
-  /** `uid`: an account's membership index; `login`: the pending-invite index for that login. */
-  index?: ({ uid: number; role: TeamIndexRole | null } | { login: string; role: TeamIndexRole | null })[];
+  /** `uid`: an account's membership index; `login`: the pending-invite index for that login (with who invited). */
+  index?: ({ uid: number; role: TeamIndexRole | null } | { login: string; role: TeamIndexRole | null; invitedBy?: string })[];
 }
 
 const HEX16 = /^[0-9a-f]{16}$/;
@@ -153,7 +157,16 @@ async function authenticate(req: Request, env: TeamEnv): Promise<Caller | null> 
   return device ? { uid: who.uid, login: who.login.toLowerCase(), device } : null;
 }
 
-const TEAM_PATH = /^\/v1\/teams\/([0-9a-f]{16})(?:\/(invites|accept|devices|keys|roles|ws|members\/([^/]+)))?$/;
+const TEAM_PATH = /^\/v1\/teams\/([0-9a-f]{16})(?:\/(invites|accept|devices|keys|roles|ws|members\/([^/]+)|invites\/([^/]+)))?$/;
+
+/** The login in a path segment, lowercased; null if it isn't one. */
+function pathLogin(segment: string): string | null {
+  try {
+    return parseLogin(decodeURIComponent(segment));
+  } catch {
+    return null;
+  }
+}
 
 /** Handle /v1/teams and /v1/teams/*; null for any other path. */
 export async function handleTeams(req: Request, env: TeamEnv, pathname: string): Promise<Response | null> {
@@ -185,7 +198,7 @@ export async function handleTeams(req: Request, env: TeamEnv, pathname: string):
     if (!m) return json(404, { error: "not found" });
     teamId = m[1];
     const team = env.TEAMS.get(env.TEAMS.idFromName(teamId));
-    const route = `${req.method} ${m[3] !== undefined ? "members" : (m[2] ?? "")}`;
+    const route = `${req.method} ${m[3] !== undefined ? "members" : m[4] !== undefined ? "invite" : (m[2] ?? "")}`;
     const body = req.method === "POST" || req.method === "PUT" ? await readBody(req) : null;
     switch (route) {
       case "GET ":
@@ -226,15 +239,15 @@ export async function handleTeams(req: Request, env: TeamEnv, pathname: string):
         if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") return json(426, { error: "expected a websocket" });
         return team.fetch(upgradeRequest(caller.uid, caller.login, caller.device.deviceId));
       case "DELETE members": {
-        let raw: string;
-        try {
-          raw = decodeURIComponent(m[3]);
-        } catch {
-          return json(400, { error: "bad login" });
-        }
-        const login = parseLogin(raw);
+        const login = pathLogin(m[3]);
         if (!login) return json(400, { error: "bad login" });
         r = await team.remove(caller, login);
+        break;
+      }
+      case "DELETE invite": {
+        const login = pathLogin(m[4]);
+        if (!login) return json(400, { error: "bad login" });
+        r = await team.revokeInvite(caller, login);
         break;
       }
       case "POST roles": {
@@ -252,7 +265,7 @@ export async function handleTeams(req: Request, env: TeamEnv, pathname: string):
   for (const u of r.index ?? []) {
     try {
       const stub = "uid" in u ? usersByUid(env, u.uid) : invitesByLogin(env, u.login);
-      await stub.setTeam(teamId, r.name ?? "", u.role);
+      await stub.setTeam(teamId, r.name ?? "", u.role, "invitedBy" in u ? u.invitedBy : undefined);
     } catch {}
   }
   return json(r.status, r.body);
@@ -275,6 +288,9 @@ export class Team extends DurableObject<TeamEnv> {
     sql.exec("CREATE TABLE IF NOT EXISTS keys (epoch INTEGER NOT NULL, deviceId TEXT NOT NULL, sealed TEXT NOT NULL, by TEXT NOT NULL, sig TEXT NOT NULL, PRIMARY KEY (epoch, deviceId))");
     sql.exec("CREATE TABLE IF NOT EXISTS commits (epoch INTEGER PRIMARY KEY, hash TEXT NOT NULL, by TEXT NOT NULL, sig TEXT NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS invites (login TEXT PRIMARY KEY)");
+    // invited_by = the inviting admin's login (0.6.1). Teams made before it have the table without
+    // the column; their old invites keep NULL there (inviter unknown).
+    addColumnIfMissing(sql, "invites", "invited_by", "TEXT");
     sql.exec("CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, by TEXT NOT NULL, event TEXT NOT NULL, subject TEXT NOT NULL)");
   }
 
@@ -398,9 +414,14 @@ export class Team extends DurableObject<TeamEnv> {
       role: m.role,
       devices: devices.filter((d) => d.uid === m.uid).map((d) => ({ deviceId: d.deviceId, signPub: d.signPub, boxPub: d.boxPub, hasKey: d.hasKey === 1 })),
     }));
-    const invites = this.sql.exec<{ login: string }>("SELECT login FROM invites ORDER BY rowid").toArray().map((i) => i.login);
+    const inviteDetails = this.sql
+      .exec<{ login: string; invited_by: string | null }>("SELECT login, invited_by FROM invites ORDER BY rowid")
+      .toArray()
+      .map((i) => ({ login: i.login, invitedBy: i.invited_by ?? null }));
+    // `invites` stays a list of logins for 0.6.0 clients; `inviteDetails` adds who invited.
+    const invites = inviteDetails.map((i) => i.login);
     const log = this.sql.exec("SELECT at, by, event, subject FROM log ORDER BY id").toArray();
-    return ok({ name: g.name, epoch: g.epoch, members, invites, log });
+    return ok({ name: g.name, epoch: g.epoch, members, invites, inviteDetails, log });
   }
 
   /** Admin invites `login`. Idempotent for an existing invite; 409 if a member is shown as that login. */
@@ -410,11 +431,24 @@ export class Team extends DurableObject<TeamEnv> {
     if (this.memberByLogin(login)) return fail(409, "already a member");
     if (this.sql.exec("SELECT 1 FROM invites WHERE login = ?", login).toArray().length) return ok();
     this.ctx.storage.transactionSync(() => {
-      this.sql.exec("INSERT INTO invites (login) VALUES (?)", login);
+      this.sql.exec("INSERT INTO invites (login, invited_by) VALUES (?, ?)", login, caller.login);
       this.log(caller.login, "invited", login);
     });
     this.changed();
-    return { ...ok(), name: g.name, index: [{ login, role: "invited" }] };
+    return { ...ok(), name: g.name, index: [{ login, role: "invited", invitedBy: caller.login }] };
+  }
+
+  /** Admin cancels the pending invite for `login`. 404 if there is none. */
+  revokeInvite(caller: Caller, login: string): TeamResult {
+    const g = this.guard(caller, true);
+    if ("status" in g) return g;
+    if (!this.sql.exec("SELECT 1 FROM invites WHERE login = ?", login).toArray().length) return fail(404, "no such invite");
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("DELETE FROM invites WHERE login = ?", login);
+      this.log(caller.login, "invite-revoked", login);
+    });
+    this.changed();
+    return { ...ok(), name: g.name, index: [{ login, role: null }] };
   }
 
   /**

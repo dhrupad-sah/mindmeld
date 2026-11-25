@@ -19,9 +19,12 @@ import {
   getRoster,
   inviteMember,
   inviteMessage,
+  invitedByText,
   listTeams,
   normLogin,
+  planAccept,
   removeAndRotate,
+  revokeInvite,
   setRole,
   signIn,
   signInLine,
@@ -45,7 +48,9 @@ const USAGE = `mindmeld — let teammates' Claude Code sessions ask each other q
   mindmeld team                                    show your team: members, devices, invites, activity
   mindmeld team create <name>                      create a team (you're its admin)
   mindmeld team invite <github-login>              invite someone (admins)
-  mindmeld team accept [team]                      accept an invite, or use a team you're already in
+  mindmeld team uninvite <github-login>            cancel a pending invite (admins)
+  mindmeld team accept [team]                      accept an invite, or use a team you're already in;
+                                                       with no team, lists pending invites and who sent them
   mindmeld team remove <github-login> [-y]         remove someone and rotate the team key (admins)
   mindmeld team role <github-login> admin|member   change someone's role (admins)
   mindmeld sessions                                list Claude sessions in this directory
@@ -176,7 +181,7 @@ async function main() {
   }
 }
 
-/** `mindmeld team [create|invite|accept|remove|role]`: the CLI side of the MCP team tools. */
+/** `mindmeld team [create|invite|uninvite|accept|remove|role]`: the CLI side of the MCP team tools. */
 async function team(args: string[], yes: boolean): Promise<void> {
   const [sub, a, b] = args;
   const config = loadConfigOrNull();
@@ -195,7 +200,7 @@ async function team(args: string[], yes: boolean): Promise<void> {
       if (!config?.team) {
         const invites = (await listTeams(relay, session)).filter((t) => t.role === "invited");
         console.log("You're not in a team yet. Create one with `mindmeld team create <name>`, or accept an invite with `mindmeld team accept`.");
-        if (invites.length) console.log(`Pending invites: ${invites.map((t) => `"${t.name}"`).join(", ")}`);
+        if (invites.length) console.log(`Pending invites: ${invites.map((t) => `"${t.name}" (${invitedByText(t)})`).join(", ")}`);
         return;
       }
       console.log(formatTeam(await getRoster(relay, session, config.team.teamId), { uid: session.uid, deviceId: loadOrCreateIdentity().deviceId }));
@@ -216,20 +221,35 @@ async function team(args: string[], yes: boolean): Promise<void> {
       console.log(inviteMessage(a, t.name));
       return;
     }
+    case "uninvite": {
+      if (!a) throw new Error("usage: mindmeld team uninvite <github-login>");
+      const t = current();
+      const who = normLogin(a);
+      try {
+        await revokeInvite(relay, session, t.teamId, who);
+      } catch (e) {
+        if ((e as { status?: number }).status === 404) throw new Error(`@${who} has no pending invite to team "${t.name}"`);
+        throw e;
+      }
+      console.log(`${cyan("✓")} cancelled the invite for @${who} to team "${t.name}".`);
+      return;
+    }
     case "accept": {
-      const teams = await listTeams(relay, session);
-      const q = args.slice(1).join(" ").trim().toLowerCase();
-      const match = q ? teams.filter((t) => t.teamId === q || t.name.toLowerCase() === q) : teams;
-      if (match.length === 0) throw new Error(`no pending invite or team${q ? ` called "${q}"` : ""} for @${session.login}`);
-      if (match.length > 1) throw new Error(`several teams and invites (${match.map((t) => `"${t.name}"`).join(", ")}): say which, e.g. mindmeld team accept ${match[0].name}`);
-      if (match[0].role !== "invited") {
-        useTeam({ teamId: match[0].teamId, name: match[0].name });
-        console.log(`${cyan("✓")} this machine now uses team ${bold(match[0].name)}, where you're ${match[0].role}.`);
+      const plan = planAccept(await listTeams(relay, session), args.slice(1).join(" "), session.login, "mindmeld team accept");
+      if ("text" in plan) {
+        if (plan.isError) throw new Error(plan.text);
+        console.log(plan.text);
         return;
       }
-      await acceptInvite(relay, session, match[0].teamId);
-      useTeam({ teamId: match[0].teamId, name: match[0].name });
-      console.log(`${cyan("✓")} joined team ${bold(match[0].name)}. A teammate's mindmeld gives this device the team key when one of them is online.`);
+      if ("use" in plan) {
+        useTeam({ teamId: plan.use.teamId, name: plan.use.name });
+        console.log(`${cyan("✓")} this machine now uses team ${bold(plan.use.name)}, where you're ${plan.use.role}.`);
+        return;
+      }
+      const t = plan.join;
+      await acceptInvite(relay, session, t.teamId);
+      useTeam({ teamId: t.teamId, name: t.name });
+      console.log(`${cyan("✓")} joined team ${bold(t.name)} (${invitedByText(t)}). A teammate's mindmeld gives this device the team key when one of them is online.`);
       return;
     }
     case "remove": {
@@ -259,7 +279,7 @@ async function team(args: string[], yes: boolean): Promise<void> {
       return;
     }
     default:
-      throw new Error(`unknown team command "${sub}" (create, invite, accept, remove, role)`);
+      throw new Error(`unknown team command "${sub}" (create, invite, uninvite, accept, remove, role)`);
   }
 }
 

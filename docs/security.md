@@ -13,7 +13,7 @@ Both go through a relay (a Cloudflare Worker, [`relay-worker/`](../relay-worker/
 
 Teams:
 
-- Team names, members' GitHub numeric user ids and current logins, roles, pending invites (by login), and a membership log (who created, invited, joined, removed, rotated).
+- Team names, members' GitHub numeric user ids and current logins, roles, pending invites (by login, with the login of the admin who sent each), and a membership log (who created, invited, cancelled an invite, joined, removed, rotated).
 - Each device's public keys (Ed25519 signing key and X25519 box key) and device id.
 - Which devices are connected right now, when, and how much data moves.
 - Sealed (encrypted) team keys, one per device per epoch, and the signatures on them.
