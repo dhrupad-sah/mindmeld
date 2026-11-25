@@ -63,6 +63,8 @@ interface PendingAsk {
 
 /** A directed payload the channel could not address (e.g. the peer's device is no longer on the team roster). */
 const unreachable = (name: string) => `can't reach ${name}'s session right now`;
+/** Peer-id ownership bindings kept, so hello spam with random peer ids stays bounded. */
+const MAX_PEER_OWNERS = 1000;
 
 export class Daemon extends EventEmitter {
   readonly peerId = randomUUID();
@@ -76,7 +78,8 @@ export class Daemon extends EventEmitter {
   private readonly askLog = new Map<string, number[]>();
   /**
    * Verified login that first used each peer id (only for channels that report logins). A hello,
-   * bye or reply for that peer id from any other login is ignored. Never cleared: peer ids are random.
+   * bye or reply for that peer id from any other login is ignored. Bounded by MAX_PEER_OWNERS: beyond
+   * it, the oldest bindings of peers that are not online are forgotten.
    */
   private readonly peerOwner = new Map<string, string>();
   private share: { label: string } | null;
@@ -238,7 +241,15 @@ export class Daemon extends EventEmitter {
   private ownsPeer(peerId: string, login: string | undefined): boolean {
     if (login === undefined) return true;
     const owner = this.peerOwner.get(peerId);
-    if (owner === undefined) this.peerOwner.set(peerId, login);
+    if (owner === undefined) {
+      this.peerOwner.set(peerId, login);
+      if (this.peerOwner.size > MAX_PEER_OWNERS) {
+        for (const old of this.peerOwner.keys()) {
+          if (this.peerOwner.size <= MAX_PEER_OWNERS) break;
+          if (!this.peers.has(old) && old !== peerId) this.peerOwner.delete(old);
+        }
+      }
+    }
     return owner === undefined || owner === login;
   }
 

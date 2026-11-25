@@ -27,28 +27,29 @@ function sealKey(shared: Uint8Array, ephPub: Uint8Array, boxPub: Uint8Array): Bu
  * Seal bytes to one device's X25519 key (anonymous sender).
  * Fresh ephemeral X25519 keypair; shared = X25519(ephPriv, boxPub);
  * key = HKDF-SHA256(ikm = shared, salt = ephPub(32) ‖ boxPub(32), info = utf8 "mindmeld/seal/v1", L = 32);
- * AES-256-GCM with a random 96-bit nonce, no AAD. Output base64(ephPub ‖ nonce ‖ ct ‖ tag).
+ * AES-256-GCM with a random 96-bit nonce and AAD = `aad` when given; without `aad` no AAD is set at all
+ * (byte-identical to before `aad` existed; team key wraps use it this way). Output base64(ephPub ‖ nonce ‖ ct ‖ tag).
  * The key is single-use (fresh ephemeral per call), so nonce reuse cannot occur.
  */
-export function sealToDevice(boxPub: string, plaintext: Uint8Array): string {
+export function sealToDevice(boxPub: string, plaintext: Uint8Array, aad?: Uint8Array): string {
   const recipient = hexToBytes(boxPub);
   const ephPriv = x25519.utils.randomSecretKey();
   const ephPub = x25519.getPublicKey(ephPriv);
   const key = sealKey(x25519.getSharedSecret(ephPriv, recipient), ephPub, recipient);
-  return Buffer.concat([ephPub, sealBytes(key, plaintext)]).toString("base64");
+  return Buffer.concat([ephPub, sealBytes(key, plaintext, aad)]).toString("base64");
 }
 
 /**
- * Inverse of `sealToDevice` using this device's boxPriv: shared = X25519(boxPriv, ephPub), same HKDF and AES-256-GCM.
- * Returns null on any failure (sealed to another device, tampered, malformed); never throws.
+ * Inverse of `sealToDevice` using this device's boxPriv: shared = X25519(boxPriv, ephPub), same HKDF and AES-256-GCM,
+ * with the same `aad` (or none). Returns null on any failure (sealed to another device, other AAD, tampered, malformed); never throws.
  */
-export function openFromDevice(id: DeviceIdentity, sealed: string): Uint8Array | null {
+export function openFromDevice(id: DeviceIdentity, sealed: string, aad?: Uint8Array): Uint8Array | null {
   try {
     const buf = Buffer.from(sealed, "base64");
     if (buf.length < 32 + 28) return null;
     const ephPub = buf.subarray(0, 32);
     const key = sealKey(x25519.getSharedSecret(hexToBytes(id.boxPriv), ephPub), ephPub, hexToBytes(id.boxPub));
-    const out = openBytes(key, buf.subarray(32));
+    const out = openBytes(key, buf.subarray(32), aad);
     return out === null ? null : new Uint8Array(out);
   } catch {
     return null;
@@ -102,16 +103,18 @@ export interface DirectFrame {
 }
 
 const directSigMessage = (teamId: string, dev: string, to: string, s: string) => new TextEncoder().encode(`mm-dm|v1|${teamId}|${dev}|${to}|${s}`);
+const directAad = (teamId: string, dev: string, to: string) => new TextEncoder().encode(`mm-dm|v1|${teamId}|${dev}|${to}`);
 
 /**
  * Seal and sign a payload for one recipient device (questions, answers, statuses, declines, snippets).
- * s   = sealToDevice(to.boxPub, utf8 payload), the construction documented on `sealToDevice`
- *       (fresh ephemeral X25519, HKDF-SHA256 "mindmeld/seal/v1", AES-256-GCM);
+ * s   = sealToDevice(to.boxPub, utf8 payload, aad = utf8("mm-dm|v1|" + teamId + "|" + id.deviceId + "|" + to.deviceId)),
+ *       the construction documented on `sealToDevice` (fresh ephemeral X25519, HKDF-SHA256 "mindmeld/seal/v1", AES-256-GCM);
  * sig = hex Ed25519(signPriv, utf8("mm-dm|v1|" + teamId + "|" + id.deviceId + "|" + to.deviceId + "|" + s)).
- * Only the recipient's boxPriv opens `s`; the signature binds the sender device, the recipient device and the team.
+ * Only the recipient's boxPriv opens `s`. The signature and the AAD both bind the sender device, the recipient
+ * device and the team, so `s` cannot be re-signed and passed off as another device's message.
  */
 export function sealDirect(teamId: string, id: DeviceIdentity, to: { deviceId: string; boxPub: string }, payload: string): DirectFrame {
-  const s = sealToDevice(to.boxPub, new TextEncoder().encode(payload));
+  const s = sealToDevice(to.boxPub, new TextEncoder().encode(payload), directAad(teamId, id.deviceId, to.deviceId));
   const sig = Buffer.from(ed25519.sign(directSigMessage(teamId, id.deviceId, to.deviceId, s), hexToBytes(id.signPriv))).toString("hex");
   return { dev: id.deviceId, to: to.deviceId, s, sig };
 }
@@ -121,7 +124,7 @@ export function sealDirect(teamId: string, id: DeviceIdentity, to: { deviceId: s
  * lowercase hex (checked first) and `f.to` must be `id.deviceId`. The sender is looked up in `roster`
  * by `f.dev`; the Ed25519 signature over utf8("mm-dm|v1|" + teamId + "|" + dev + "|" + to + "|" + s)
  * is checked (strict Ed25519, zip215: false) against that entry's signPub BEFORE opening; then `s` is
- * opened with `openFromDevice` and decoded as strict UTF-8. Returns the roster uid, login and payload,
+ * opened with `openFromDevice` and AAD utf8("mm-dm|v1|" + teamId + "|" + dev + "|" + to), and decoded as strict UTF-8. Returns the roster uid, login and payload,
  * or null on any failure (wrong recipient, unknown device, bad signature, decrypt failure, malformed
  * input); never throws.
  */
@@ -138,7 +141,7 @@ export function openDirect(
     const sender = roster.get(f.dev);
     if (!sender) return null;
     if (!ed25519.verify(hexToBytes(f.sig), directSigMessage(teamId, f.dev, f.to, f.s), hexToBytes(sender.signPub), { zip215: false })) return null;
-    const plain = openFromDevice(id, f.s);
+    const plain = openFromDevice(id, f.s, directAad(teamId, f.dev, f.to));
     if (plain === null) return null;
     return { uid: sender.uid, login: sender.login, payload: new TextDecoder("utf-8", { fatal: true }).decode(plain) };
   } catch {

@@ -162,4 +162,19 @@ describe("Daemon over a Channel", () => {
     expect(channel.sent.filter((p) => p.type === "ask" || p.type === "snippet")).toEqual([]);
     void daemon.stop();
   });
+
+  it("caps remembered peer owners, keeping those of peers still online", () => {
+    const { channel, daemon } = setup();
+    channel.emit("payload", { type: "hello", peer: "keep", name: "bob", project: "x", v: 3 }, { cid: "c1", login: "bob" });
+    for (let i = 0; i < 1100; i++) {
+      channel.emit("payload", { type: "hello", peer: `p${i}`, name: "m", project: "x", v: 3 }, { cid: "c2", login: "mallory" });
+      channel.emit("payload", { type: "bye", peer: `p${i}` }, { cid: "c2", login: "mallory" });
+    }
+    const owners = (daemon as unknown as { peerOwner: Map<string, string> }).peerOwner;
+    expect(owners.size).toBeLessThanOrEqual(1000);
+    expect(owners.get("keep")).toBe("bob");
+    channel.emit("payload", { type: "hello", peer: "keep", name: "x", project: "evil", v: 3 }, { cid: "c3", login: "mallory" });
+    expect(daemon.onlinePeers().find((p) => p.peer === "keep")?.name).toBe("bob");
+    void daemon.stop();
+  });
 });

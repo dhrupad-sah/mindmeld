@@ -48,8 +48,13 @@ export const tooOldForTeams = (version: string) => `mindmeld ${version} is too o
 const TeamFrameSchema = z.object({ e: z.number().int(), dev: z.string(), d: z.string(), sig: z.string() });
 const DirectFrameSchema = z.object({ dev: z.string(), to: z.string(), s: z.string(), sig: z.string() });
 
-/** Payloads between two people: sealed to the recipient device and delivered only to it. */
-const DIRECTED = new Set<Payload["type"]>(["ask", "status", "answer", "decline", "snippet"]);
+/**
+ * The only payloads broadcast to the team under the team key. Everything else (ask, status, answer,
+ * decline, snippet, and any kind added later) is sealed to the recipient device, never broadcast.
+ */
+const PRESENCE = new Set<string>(["hello", "bye"]);
+/** Most peer bindings kept (oldest evicted first), so hello spam with random peer ids stays bounded. */
+const MAX_PEERS = 1000;
 
 /** What the relay sends on a team socket. `c`, `uid` and `login` are routing hints only, never identity. */
 const TeamMessage = z.discriminatedUnion("t", [
@@ -100,8 +105,12 @@ export class TeamChannel extends EventEmitter implements Channel {
   private admitted = false;
   private stopped = false;
   private roster = new Map<string, { uid: number; login: string; signPub: string; boxPub: string }>();
-  /** Peer id -> the verified device of its first hello. Never rebound or cleared: peer ids are random. */
-  private readonly peerDevice = new Map<string, string>();
+  /**
+   * Peer id -> the verified sender (uid, device) and connection of its hello. A hello or bye for a
+   * bound peer id from another GitHub id is dropped; the binding goes on that peer's bye, on its
+   * connection's "left", or when evicted (oldest first, beyond MAX_PEERS).
+   */
+  private readonly peerDevice = new Map<string, { uid: number; device: string; cid: string }>();
   private keys = new Map<number, Uint8Array>();
   private currentEpoch = 0;
   /** Relay connection id -> the verified GitHub id of its first frame. */
@@ -217,7 +226,7 @@ export class TeamChannel extends EventEmitter implements Channel {
    * none or that device is not on the roster (nothing is sent, and never as a broadcast).
    */
   send(p: Payload, to?: SendTarget): boolean {
-    if (!DIRECTED.has(p.type)) {
+    if (PRESENCE.has(p.type)) {
       const key = this.keys.get(this.currentEpoch);
       if (!this.connected || !key) return true;
       const f = sealFrame(this.currentEpoch, key, this.opts.id, JSON.stringify(p));
@@ -225,7 +234,7 @@ export class TeamChannel extends EventEmitter implements Channel {
       this.framesSent++;
       return true;
     }
-    const deviceId = to?.device ?? (to?.peer !== undefined ? this.peerDevice.get(to.peer) : undefined);
+    const deviceId = to?.device ?? (to?.peer !== undefined ? this.peerDevice.get(to.peer)?.device : undefined);
     const recipient = deviceId !== undefined ? this.roster.get(deviceId) : undefined;
     if (deviceId === undefined || !recipient) return false;
     if (!this.connected) return true;
@@ -383,6 +392,7 @@ export class TeamChannel extends EventEmitter implements Channel {
         break;
       case "left":
         this.cidUid.delete(msg.c);
+        for (const [peer, b] of this.peerDevice) if (b.cid === msg.c) this.peerDevice.delete(peer);
         this.emit("left", msg.c);
         break;
       case "roster":
@@ -449,9 +459,21 @@ export class TeamChannel extends EventEmitter implements Channel {
     } catch {
       return false;
     }
-    if (DIRECTED.has(p.type) !== direct) return false;
+    // Presence only as a broadcast; everything else only sealed to this device.
+    if (PRESENCE.has(p.type) === direct) return false;
+    if (p.type === "hello" || p.type === "bye") {
+      const bound = this.peerDevice.get(p.peer);
+      if (bound && bound.uid !== opened.uid) return false; // another member's peer id
+      this.peerDevice.delete(p.peer);
+      if (p.type === "hello") {
+        this.peerDevice.set(p.peer, { uid: opened.uid, device, cid: c });
+        for (const oldest of this.peerDevice.keys()) {
+          if (this.peerDevice.size <= MAX_PEERS) break;
+          this.peerDevice.delete(oldest);
+        }
+      }
+    }
     this.cidUid.set(c, opened.uid);
-    if (p.type === "hello" && !this.peerDevice.has(p.peer)) this.peerDevice.set(p.peer, device);
     this.emit("payload", p, { cid: c, login: opened.login, uid: opened.uid, device } satisfies PayloadSender);
     return true;
   }

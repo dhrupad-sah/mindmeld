@@ -17,7 +17,7 @@ Teams:
 - Each device's public keys (Ed25519 signing key and X25519 box key) and device id.
 - Which devices are connected right now, when, and how much data moves.
 - Sealed (encrypted) team keys, one per device per epoch, and the signatures on them.
-- For each direct message (a question, a progress status, an answer, a decline or a snippet): the team, the sending device id, the recipient device id, when it was sent and its size. Not its content, and not which kind of payload it is.
+- For each direct message (a question, a progress status, an answer, a decline or a snippet): the team, the sending device id, the recipient device id, when it was sent and its size. Not its content, and not which kind of payload it is (though size and timing may suggest it, e.g. small fixed-size statuses).
 
 The relay never sees team keys or the plaintext of anything the team sends. Frames pass through as ciphertext plus a signature.
 
@@ -72,7 +72,7 @@ Seals bytes (a team key) to one device's X25519 key:
 
 - Fresh ephemeral X25519 key pair per call. `shared = X25519(ephPriv, boxPub)`.
 - `key = HKDF-SHA256(ikm = shared, salt = ephPub (32 bytes) || boxPub (32 bytes), info = "mindmeld/seal/v1", length = 32)`.
-- AES-256-GCM with a random 96-bit nonce, no AAD.
+- AES-256-GCM with a random 96-bit nonce. No AAD for key wraps; direct messages pass an AAD (below).
 - Output: `base64(ephPub || nonce || ciphertext || tag)`.
 
 The key is used once, so nonce reuse cannot happen. The sender is anonymous at this layer; authenticity comes from the signed wrap below.
@@ -108,22 +108,22 @@ Presence payloads (`hello`, `bye`) go to the whole team as a frame `{ e, dev, d,
 - `d = base64(nonce || ciphertext || tag)` of AES-256-GCM(team key for epoch `e`, payload, random 96-bit nonce, AAD = `"mindmeld/frame/v1|" + e + "|" + dev`).
 - `sig = Ed25519(signPriv, UTF-8(e + "|" + dev + "|" + d))`.
 
-The receiver checks that `dev` is 16 lowercase hex characters, looks it up in the roster, **verifies the signature first**, then decrypts. The sender (GitHub id, and login for display) comes from the roster entry for the verified device, not from anything the relay stamps on it; a frame whose relay-stamped GitHub id disagrees is dropped, and a connection stays bound to the GitHub id of its first verified frame. The relay forwards a frame only if `dev` is the sending socket's own device, and sends it to every other team socket. A broadcast frame that turns out to carry anything other than `hello` or `bye` is dropped by the receiver.
+The receiver checks that `dev` is 16 lowercase hex characters, looks it up in the roster, **verifies the signature first**, then decrypts. The sender (GitHub id, and login for display) comes from the roster entry for the verified device, not from anything the relay stamps on it; a frame whose relay-stamped GitHub id disagrees is dropped, and a connection stays bound to the GitHub id of its first verified frame. The relay forwards a frame only if `dev` is the sending socket's own device, and sends it to every other team socket. Only `hello` and `bye` are ever broadcast (an allowlist: any other payload kind, including one a later version adds, must go as a direct message or not at all), and a broadcast frame that turns out to carry anything else is dropped by the receiver.
 
 ### Direct messages
 
 Questions, progress statuses, answers, declines and snippets go to one device. The client sends the relay `{ t: "dm", to, f: { dev, to, s, sig } }`:
 
-- `s = sealToDevice(recipient boxPub, UTF-8(payload JSON))`, the construction above (fresh ephemeral X25519 key, HKDF-SHA256 with info `"mindmeld/seal/v1"`, AES-256-GCM). Only the recipient device's X25519 private key opens it.
+- `s = sealToDevice(recipient boxPub, UTF-8(payload JSON), AAD = UTF-8("mm-dm|v1|" + teamId + "|" + dev + "|" + to))`, the construction above (fresh ephemeral X25519 key, HKDF-SHA256 with info `"mindmeld/seal/v1"`, AES-256-GCM). Only the recipient device's X25519 private key opens it. The AAD binds the sender: if someone (for example the relay colluding with another member) re-signs `s` under a different `dev`, it no longer opens.
 - `sig = Ed25519(signPriv of the sending device, UTF-8("mm-dm|v1|" + teamId + "|" + dev + "|" + to + "|" + s))`.
 
 Source: `sealDirect` and `openDirect` in `src/teamcrypto.ts`, routing in `src/teamchannel.ts` and `relay-worker/src/teamsocket.ts`.
 
-**Routing on the relay.** The relay forwards a `dm` only if `f.dev` is the sending socket's own device, `to` equals `f.to`, and `to` is a device currently on the team roster. It then sends `{ t: "dm", f, c, uid, login }` (stamped like a broadcast frame) only to the sockets of device `to`, never to anyone else. Anything else is dropped. A device may have several sockets (several Claude sessions on one machine share its device key); all of them get it, and each session keeps only what is addressed to its own peer id.
+**Routing on the relay.** The relay forwards a `dm` only if `f.dev` is the sending socket's own device, `to` equals `f.to`, and `to` is a device currently on the team roster. It then sends `{ t: "dm", f, c, uid, login }` (stamped like a broadcast frame) only to the sockets of device `to`, never to anyone else. Anything else is dropped. A device may have several sockets (several Claude sessions on one machine share its device key); all of them get it, and each session keeps only what is meant for it: a question or snippet addressed to its own peer id, or a status, answer or decline whose id matches a question it is waiting on.
 
-**Addressing on the client.** An ask or snippet names the target session's peer id; the client seals it to the device that sent that peer id's first verified `hello` (a peer id is never rebound to another device). Statuses, answers and declines go back to the device the question came from, which is known from the question's verified signature (askers never announce themselves). If the recipient can't be resolved to a device on the current roster, nothing is sent, and the ask fails with "can't reach <name>'s session right now". There is no fallback to a broadcast.
+**Addressing on the client.** An ask or snippet names the target session's peer id; the client seals it to the device that sent that peer id's verified `hello`. A peer id stays bound to the GitHub id that announced it: a `hello` or `bye` for it from another member is dropped. The binding goes when that peer says `bye`, when its connection closes, or when it is evicted (at most 1,000 are kept, oldest first). Statuses, answers and declines go back to the device the question came from, which is known from the question's verified signature (askers never announce themselves). If the recipient can't be resolved to a device on the current roster, nothing is sent, and the ask fails with "can't reach <name>'s session right now". There is no fallback to a broadcast.
 
-**Checks on receipt.** The receiver requires, in order: `dev` and `to` are 16 lowercase hex characters; `to` is its own device id; `dev` is a device on the current roster; the signature verifies against that device's signing key (strict, `zip215: false`); `s` opens with its own X25519 key. The sender (GitHub id, and login for display) is the roster entry for `dev`, never anything in the payload; a frame whose relay-stamped GitHub id disagrees is dropped, and the connection binding applies as for broadcast frames. A `dm` carrying `hello` or `bye` is dropped. Anything that fails a check is dropped (and counted in the channel's `framesDropped`).
+**Checks on receipt.** The receiver requires, in order: `dev` and `to` are 16 lowercase hex characters; `to` is its own device id; `dev` is a device on the current roster; the signature verifies against that device's signing key (strict, `zip215: false`); `s` opens with its own X25519 key and the AAD built from `teamId`, `dev` and `to`. The sender (GitHub id, and login for display) is the roster entry for `dev`, never anything in the payload; a frame whose relay-stamped GitHub id disagrees is dropped, and the connection binding applies as for broadcast frames. A `dm` carrying `hello` or `bye` is dropped. Anything that fails a check is dropped (and counted in the channel's `framesDropped`).
 
 **Client versions.** Team sockets carry the client version (`?v=`). The relay refuses team clients below `TEAM_MIN_VERSION` (0.7.0), or that send no version, closing with code 4005 and "mindmeld <v> is too old for teams; update: claude plugin update mindmeld@mindmeld". So no team member can still be sending questions or answers under the team key. Legacy groups keep their own minimum (0.5.0).
 

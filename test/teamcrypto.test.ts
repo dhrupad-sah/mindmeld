@@ -152,6 +152,25 @@ describe("teamcrypto", () => {
       expect(openDirect(teamId, sealDirect(teamId, alice, bob, "hi"), bob, roster)).not.toBeNull();
     });
 
+    it("binds the sender into the seal: a dm re-signed as another member does not open", () => {
+      const f = sealDirect(teamId, alice, bob, "from alice");
+      // A relay colluding with carol re-signs alice's sealed body as carol's own frame.
+      const sig = Buffer.from(ed25519.sign(new TextEncoder().encode(`mm-dm|v1|${teamId}|${carol.deviceId}|${bob.deviceId}|${f.s}`), Buffer.from(carol.signPriv, "hex"))).toString("hex");
+      expect(openDirect(teamId, { dev: carol.deviceId, to: bob.deviceId, s: f.s, sig }, bob, withCarol)).toBeNull();
+      // The body is not a plain sealToDevice either: it needs the dm binding to open.
+      expect(openFromDevice(bob, f.s)).toBeNull();
+      expect(openFromDevice(bob, f.s, new TextEncoder().encode(`mm-dm|v1|${teamId}|${alice.deviceId}|${bob.deviceId}`))).not.toBeNull();
+    });
+
+    it("sealToDevice without AAD is unchanged: no AAD set, and AAD must match when given", () => {
+      const aad = new TextEncoder().encode("ctx");
+      const plain = new Uint8Array(randomBytes(32));
+      expect(openFromDevice(bob, sealToDevice(bob.boxPub, plain, aad), aad)).toEqual(plain);
+      expect(openFromDevice(bob, sealToDevice(bob.boxPub, plain, aad))).toBeNull();
+      expect(openFromDevice(bob, sealToDevice(bob.boxPub, plain), aad)).toBeNull();
+      expect(openFromDevice(bob, sealToDevice(bob.boxPub, plain))).toEqual(plain);
+    });
+
     it("uses strict Ed25519", () => {
       const f = sealDirect(teamId, alice, bob, "hi");
       const identity = "01" + "00".repeat(31);

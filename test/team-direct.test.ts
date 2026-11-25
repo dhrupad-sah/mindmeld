@@ -192,8 +192,51 @@ describe("direct (per-recipient) team messages", () => {
     expect(a.send(ask, { peer: "nobody" })).toBe(false);
     expect(a.send(ask, { device: "0123456789abcdef" })).toBe(false);
     expect(a.framesSent).toBe(0);
+    // A payload kind that is not presence (for example one added by a later version) is never broadcast.
+    expect(a.send({ type: "future-kind", id: "x" } as unknown as Payload)).toBe(false);
+    expect(a.framesSent).toBe(0);
     expect(a.send({ type: "hello", peer: "pa", name: "a", project: "p", v: 3 })).toBe(true);
     expect(a.framesSent).toBe(1);
+  }, 30_000);
+
+  it("peer bindings are dropped on bye and left, cannot be claimed by another member, and are capped", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const carol = await user("carol");
+    const { teamId, key } = await team(alice, [bob, carol]);
+    const a = new TeamChannel({ relayHttp: relay.url, teamId, session: session(alice), id: alice.id });
+    const got: Payload[] = [];
+    a.on("payload", (p: Payload) => got.push(p));
+    a.start();
+    cleanups.push(() => a.stop());
+    await waitFor(() => a.connected && a.status === null);
+    const inner = a as unknown as { handleMessage(raw: string): void; peerDevice: Map<string, unknown> };
+    const broadcast = (u: TestUser, p: Payload, c = `c-${u.login}`) =>
+      inner.handleMessage(JSON.stringify({ t: "msg", f: sealFrame(1, key, u.id, JSON.stringify(p)), c, uid: u.uid, login: u.login }));
+    const hello = (peer: string): Payload => ({ type: "hello", peer, name: "x", project: "p", v: 3 });
+    const ask: Payload = { type: "ask", id: "q", from: "pa", question: "?" };
+
+    broadcast(bob, hello("pb"));
+    expect(a.send(ask, { peer: "pb" })).toBe(true);
+    // Carol cannot take over bob's peer id, so asks to it still go to bob's device.
+    broadcast(carol, hello("pb"));
+    expect(got.filter((p) => p.type === "hello").length).toBe(1);
+    expect(inner.peerDevice.get("pb")).toMatchObject({ device: bob.id.deviceId });
+    broadcast(carol, { type: "bye", peer: "pb" });
+    expect(a.send(ask, { peer: "pb" })).toBe(true);
+    // Bob's own bye removes it.
+    broadcast(bob, { type: "bye", peer: "pb" });
+    expect(a.send(ask, { peer: "pb" })).toBe(false);
+    // A closed connection removes the peers it announced.
+    broadcast(bob, hello("pb2"), "c-bob-2");
+    expect(a.send(ask, { peer: "pb2" })).toBe(true);
+    inner.handleMessage(JSON.stringify({ t: "left", c: "c-bob-2", uid: bob.uid, login: bob.login }));
+    expect(a.send(ask, { peer: "pb2" })).toBe(false);
+    // Hello spam with random peer ids is capped, oldest first.
+    for (let i = 0; i < 1100; i++) broadcast(carol, hello(`spam-${i}`));
+    expect(inner.peerDevice.size).toBe(1000);
+    expect(inner.peerDevice.has("spam-99")).toBe(false);
+    expect(inner.peerDevice.has("spam-1099")).toBe(true);
   }, 30_000);
 
   it("refuses team clients older than 0.7 with a clear reason", async () => {
